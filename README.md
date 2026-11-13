@@ -8,16 +8,57 @@ a five-phase workflow:
                                →  4. Rehearsal       →  5. Production cutover
 ```
 
+**Any engine to any engine** — PostgreSQL, MariaDB, MySQL, MongoDB — with no AWS DMS.
+
+### Same engine
+
 | Engine | Full load | CDC (keep in sync until cutover) |
 |---|---|---|
 | PostgreSQL | `pg_dump` → `pg_restore` | logical replication (publication + subscription) |
 | MariaDB | `mariadb-dump` → `mariadb` | binlog replication from the dump's recorded position |
 | MySQL | `mysqldump` → `mysql` | binlog replication from the dump's recorded position |
-| MongoDB | `mongodump` → `mongorestore` | — not native; use mongosync or AWS DMS |
+| MongoDB | `mongodump` → `mongorestore` | — not native; use mongosync |
 
-Same-engine (homogeneous) migrations only. Cross-engine pairs (e.g. MySQL → PostgreSQL)
-are detected and refused, with a pointer to AWS DMS + DMS Schema Conversion — that
-problem needs schema and code conversion, which native dump tools cannot do.
+MariaDB ⇄ MySQL also uses the dump path (full load only).
+
+### Different engines (`lib/xengine.sh`)
+
+The tool converts the schema itself and transforms every row in flight. Nothing is
+written to disk.
+
+| From → to | Schema | Data path |
+|---|---|---|
+| PostgreSQL → MariaDB/MySQL | tables, types, keys, defaults, auto-increment, indexes, FKs converted | `SELECT` formats MySQL literals → batched multi-row `INSERT` |
+| MariaDB/MySQL → PostgreSQL | same, plus ENUM → `CHECK`, `TINYINT(1)` → boolean, unsigned → wider types | `SELECT` formats COPY text → `COPY … FROM STDIN` |
+| SQL → MongoDB | one collection per table; indexes → `createIndex` (unique ones keep SQL's "many NULLs allowed") | one Extended-JSON document per row → `mongoimport` |
+| MongoDB → SQL | one table per collection: `_id` + the whole document in `jsonb` / `JSON` | `mongoexport` → `COPY` / `INSERT` |
+
+Types are kept, not stringified. To MongoDB: dates → `ISODate` (UTC), BIGINT → long,
+DECIMAL and BIGINT UNSIGNED → Decimal128, binary → BinData, JSON → embedded documents,
+booleans → booleans, doubles stay doubles. From MongoDB: nothing is lost, because each
+document is stored whole as relaxed Extended JSON.
+
+What cross-engine **cannot** do, by design:
+
+- **Views, functions, procedures, triggers, events, check constraints, MongoDB
+  validators** — these are code in one engine's dialect. Translating them mechanically
+  produces SQL that runs and gives wrong answers. They are exported to
+  `xengine/manual_objects.*` and listed in `conversion.md` for a human to rewrite.
+- **CDC** — there is no native way to replicate from one engine into another. A
+  cross-engine migration is a full load inside the downtime window; `plan` tells you
+  whether it fits (raise `JOBS`, exclude data, or use a CDC pipeline such as Debezium
+  if it does not).
+- **Expression / partial / full-text / GIN indexes** — listed as warnings to re-create.
+
+`assess` produces `conversion.md` before anything is touched: the type mapping, every
+lossy or behavioural difference (case sensitivity, zero dates, `timestamptz` → UTC
+`DATETIME`), and the objects needing manual work. The generated DDL is in
+`xengine/schema.sql`, `indexes.sql` and `fks.sql`, ready for review.
+
+Cross-engine validation compares, per table, the row count, the sum of every
+integer/boolean column and the total characters of every text column, each computed
+independently by both engines (`--checksum`). Indexes and FKs that failed to create
+count as failures.
 
 Runs anywhere that can reach both databases — laptop, bastion, CI runner, on-prem or
 cloud. Client tools come from pinned Docker images; with no Docker, set
@@ -95,6 +136,25 @@ If validation fails it stops **before** CDC is torn down and tells you not to sw
 ./db-migrate validate  billing.conf [--checksum]   # row counts + object counts; --checksum adds content hashes
 ./db-migrate report    billing.conf
 ```
+
+## Tested
+
+Each path was run end to end against real servers in Docker (PostgreSQL 16, MariaDB 11,
+MySQL 8.4, MongoDB 7), with data chosen to break things: quotes, backslashes, embedded
+newlines and tabs, emoji, NULLs, binary with `\0` and `'`, JSON, arrays, enums, unsigned
+64-bit values near 2⁶⁴, composite keys, foreign keys. Values were compared field by
+field, and an MD5 over every text value matched on both sides.
+
+| Path | Result |
+|---|---|
+| PostgreSQL → PostgreSQL (full load, and CDC with live writes + cutover) | ✅ |
+| MariaDB → MariaDB (dump + binlog CDC + cutover) | ✅ |
+| MongoDB → MongoDB | ✅ |
+| PostgreSQL → MariaDB, MySQL → PostgreSQL | ✅ |
+| PostgreSQL → MongoDB, MySQL → MongoDB | ✅ |
+| MongoDB → PostgreSQL, MongoDB → MariaDB | ✅ |
+
+Not yet exercised: MySQL ⇄ MySQL CDC, RDS targets (`TGT_MANAGED=rds`).
 
 ## Things that are deliberately manual
 

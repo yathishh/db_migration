@@ -10,13 +10,15 @@
 #   4. run --phase rehearsal  the same steps, timed, as the real day will run
 #   5. cutover                production: stop writes → catch up → verify → switch
 #
-# Same-engine (homogeneous) migrations only, using each engine's native tools:
+# Same engine, with each engine's native tools:
 #   postgres   pg_dump/pg_restore, logical replication for CDC
 #   mariadb    mariadb-dump, binlog replication for CDC
 #   mysql      mysqldump,   binlog replication for CDC
 #   mongodb    mongodump/mongorestore (full load only — no native CDC)
-# Cross-engine (e.g. MySQL → Postgres) is detected and refused with a pointer
-# to AWS DMS + DMS Schema Conversion, which is the right tool for that job.
+# Different engines (postgres ⇄ mariadb/mysql, any SQL ⇄ mongodb), with no
+# AWS DMS: the schema is converted and the data transformed in flight by
+# lib/xengine.sh. Full load only; views/functions/triggers are exported for
+# manual conversion.
 #
 # Runs anywhere that can reach both databases: a laptop, a bastion, a CI runner.
 # Client tools come from pinned Docker images, or from the local PATH when
@@ -154,9 +156,12 @@ same_family() { # mariadb and mysql can exchange dumps (with care); others must 
 }
 homogeneous() { [ "$SRC_ENGINE" = "$TGT_ENGINE" ]; }
 
-require_supported_pair() {
-  same_family || die "cross-engine migration ($SRC_ENGINE → $TGT_ENGINE) needs schema conversion, which this tool does not do. Use AWS DMS with DMS Schema Conversion (or AWS SCT)."
-}
+# Every engine pair is supported: same engine / same family by native dump
+# tools (this file), different engines by schema conversion (lib/xengine.sh).
+require_supported_pair() { :; }
+
+# shellcheck source=lib/xengine.sh
+. "$HERE/lib/xengine.sh"
 
 # ── running clients ─────────────────────────────────────────────────────────
 #
@@ -213,7 +218,10 @@ use() {
       case "$ssl" in require) DBM_TLS="--ssl --ssl-verify-server-cert=0";; verify) DBM_TLS="--ssl --ssl-verify-server-cert";; disable) DBM_TLS="--skip-ssl";; *) DBM_TLS="--ssl-verify-server-cert=0";; esac ;;
     mysql)
       export MYSQL_PWD="$pw"
-      case "$ssl" in require) DBM_TLS="--ssl-mode=REQUIRED";; verify) DBM_TLS="--ssl-mode=VERIFY_IDENTITY";; disable) DBM_TLS="--ssl-mode=DISABLED";; *) DBM_TLS="--ssl-mode=PREFERRED";; esac ;;
+      case "$ssl" in require) DBM_TLS="--ssl-mode=REQUIRED";; verify) DBM_TLS="--ssl-mode=VERIFY_IDENTITY";; disable) DBM_TLS="--ssl-mode=DISABLED";; *) DBM_TLS="--ssl-mode=PREFERRED";; esac
+      # MySQL 8's default caching_sha2_password refuses a non-TLS login unless
+      # the client may fetch the server's RSA key to protect the password.
+      DBM_TLS+=" --get-server-public-key" ;;
     mongodb)
       if [ -n "${!uri_var:-}" ]; then
         MONGO_URI="${!uri_var}"
@@ -234,13 +242,15 @@ MCFG='umask 077; c=$(mktemp); trap "rm -f \"$c\"" EXIT; printf "%s\n" "$MONGO_CF
 
 # q <side> <sql> — rows on stdout, columns separated by '|'.
 # Set QDB= (empty) to connect a MariaDB/MySQL client without a default database.
+# stdin is /dev/null: `docker run -i` would otherwise swallow the input of any
+# `while read` loop that calls q() — silently ending the loop after one pass.
 q() {
   use "$1"; export DBM_SQL="$2"
   [ -z "${QDB+x}" ] || export DBM_D="$QDB"
   case "$C_ENGINE" in
-    postgres) client postgres 'psql -X -A -t -q -v ON_ERROR_STOP=1 -F "|" -h "$DBM_H" -p "$DBM_P" -U "$DBM_U" -d "$DBM_D" -c "$DBM_SQL"' ;;
-    mariadb)  client mariadb  'mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -N -B ${DBM_D:+"$DBM_D"} -e "$DBM_SQL"' | tr '\t' '|' ;;
-    mysql)    client mysql    'mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -N -B ${DBM_D:+"$DBM_D"} -e "$DBM_SQL"' | tr '\t' '|' ;;
+    postgres) client postgres 'psql -X -A -t -q -v ON_ERROR_STOP=1 -F "|" -h "$DBM_H" -p "$DBM_P" -U "$DBM_U" -d "$DBM_D" -c "$DBM_SQL"' < /dev/null ;;
+    mariadb)  client mariadb  'mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -N -B ${DBM_D:+"$DBM_D"} -e "$DBM_SQL"' < /dev/null | tr '\t' '|' ;;
+    mysql)    client mysql    'mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -N -B ${DBM_D:+"$DBM_D"} -e "$DBM_SQL"' < /dev/null | tr '\t' '|' ;;
     *) die "internal: q() on $C_ENGINE" ;;
   esac
 }
@@ -249,8 +259,8 @@ q() {
 qv() {
   use "$1"; export DBM_SQL="$2"
   case "$C_ENGINE" in
-    mariadb) client mariadb 'mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -E -e "$DBM_SQL"' ;;
-    mysql)   client mysql   'mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -E -e "$DBM_SQL"' ;;
+    mariadb) client mariadb 'mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -E -e "$DBM_SQL"' < /dev/null ;;
+    mysql)   client mysql   'mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -E -e "$DBM_SQL"' < /dev/null ;;
   esac
 }
 
@@ -260,7 +270,7 @@ js() {
   MONGO_JS="void (globalThis.db = connect(process.env.MONGO_URI).getSiblingDB(process.env.DBM_D));
 $2"
   export MONGO_JS
-  client mongodb 'mongosh --nodb --quiet --eval "$MONGO_JS"'
+  client mongodb 'mongosh --nodb --quiet --eval "$MONGO_JS"' < /dev/null
 }
 
 pg_schema_list() { local s o=""; for s in $SCHEMAS; do o+="${o:+,}'$s'"; done; printf '%s' "$o"; }
@@ -368,6 +378,7 @@ assess_postgres() {
     ok "WAL: $(hb "$d") in ${SAMPLE_SECONDS}s ≈ $(hb "${A[LOG_BYTES_PER_HOUR]}")/hour (whole cluster, this moment only)"
   fi
 
+  if is_xengine; then x_assess_target; return; fi
   log "target: connectivity, version, encoding, emptiness"
   if row="$(q tgt "SELECT current_setting('server_version_num'), current_setting('server_version'), pg_encoding_to_char(d.encoding), d.datcollate FROM pg_database d WHERE d.datname = current_database()")"; then
     local tnum tver tenc tcoll
@@ -463,6 +474,7 @@ assess_mysqlish() {
     fi
   fi
 
+  if is_xengine; then x_assess_target; return; fi
   log "target: connectivity, version, character set, emptiness"
   if row="$(QDB='' q tgt "SELECT VERSION(), @@character_set_server, @@server_id")"; then
     local tver tcs tsid
@@ -526,6 +538,7 @@ assess_mongodb() {
   CDC_ISSUES+=("This tool has no native MongoDB CDC. For short downtime use mongosync (MongoDB 6.0+ on both sides) or AWS DMS Homogeneous Data Migrations (DocumentDB / MongoDB targets).")
   NOTES+=("Users and roles are not copied (mongodump --db does not include them): create them on the target.")
 
+  if is_xengine; then x_assess_target; return; fi
   log "target: connectivity, version, emptiness"
   if out="$(js tgt 'print(db.version() + "|" + db.getCollectionNames().filter(n => !n.startsWith("system.")).length)')"; then
     IFS='|' read -r A[TGT_VERSION] A[TGT_OBJECTS] <<<"$out"
@@ -540,15 +553,17 @@ assess_mongodb() {
 cmd_assess() {
   rm -f "$STATE/top_tables.txt" "$STATE/no_pk.txt" "$STATE/lob_columns.txt" "$STATE/lob_max.txt"
   log "Assessing '$MIGRATION_NAME': $SRC_ENGINE $SRC_HOST/$SRC_DB → $TGT_ENGINE $TGT_HOST/$TGT_DB  (client: $CLIENT_MODE)"
-  if ! same_family; then
-    BLOCKERS+=("Cross-engine migration ($SRC_ENGINE → $TGT_ENGINE). Schemas, types and code must be converted: use AWS DMS with DMS Schema Conversion (or AWS SCT). This tool still assesses the source below.")
-  fi
   case "$SRC_ENGINE" in
     postgres) assess_postgres ;;
     mariadb|mysql) assess_mysqlish ;;
     mongodb) assess_mongodb ;;
   esac
   touch "$STATE/top_tables.txt" "$STATE/no_pk.txt" "$STATE/lob_columns.txt"
+  if is_xengine; then
+    x_preview
+  else
+    rm -f "$STATE/conversion.md"
+  fi
 
   # Character encoding (requirement: garbled text with non-Unicode sources)
   case "${A[SRC_ENCODING]:-}" in
@@ -607,7 +622,7 @@ write_assessment_md() {
     echo "| Version | ${A[SRC_VERSION]:-?} | ${A[TGT_VERSION]:-not reachable} |"
     echo "| Encoding / collation | ${A[SRC_ENCODING]:-?} ${A[SRC_COLLATION]:+/ ${A[SRC_COLLATION]}} | ${A[TGT_ENCODING]:-?} ${A[TGT_COLLATION]:+/ ${A[TGT_COLLATION]}} |"
     echo
-    echo "Migration type: **$(homogeneous && echo "homogeneous (same engine) — native tools" || { same_family && echo "same family ($SRC_ENGINE → $TGT_ENGINE) — native tools, full load only" || echo "heterogeneous — needs AWS DMS + Schema Conversion"; })**."
+    echo "Migration type: **$(homogeneous && echo "homogeneous (same engine) — native tools" || { same_family && echo "same family ($SRC_ENGINE → $TGT_ENGINE) — native tools, full load only" || echo "heterogeneous — schema converted by this tool, full load only (see conversion.md)"; })**."
     echo
     echo "| Objects | Count | Migrated by |"
     echo "|---|---|---|"
@@ -705,6 +720,15 @@ cmd_plan() {
     strategy="full-load+cdc"; reason="a full load alone (~${cut_full_min} min with margin) does not fit the ${DOWNTIME_MINUTES}-minute window: load in advance, keep in sync with CDC, cut over in minutes"
   fi
   [ -z "${OPT_STRATEGY:-}" ] || { strategy="$OPT_STRATEGY"; reason="forced with --strategy"; }
+
+  if is_xengine && [ "$strategy" = "full-load+cdc" ]; then
+    if [ "$PURPOSE" = replication ]; then
+      pblock+=("PURPOSE=replication across engines ($SRC_ENGINE → $TGT_ENGINE) needs a cross-engine CDC pipeline (e.g. Debezium + a sink connector); this tool moves data with a full load only.")
+    else
+      pblock+=("Cross-engine full load needs ~${cut_full_min} min with margin, more than the ${DOWNTIME_MINUTES}-minute window, and there is no cross-engine CDC. Options: a longer window, less data (EXCLUDE_DATA_TABLES / archiving), more JOBS, or a CDC pipeline such as Debezium.")
+    fi
+    strategy="full-load"; reason="cross-engine migrations are full load only"
+  fi
 
   if [ "$strategy" = "full-load+cdc" ] && [ "${CDC_READY:-no}" != yes ]; then
     pblock+=("The plan needs CDC but the source is not ready for it — fix the CDC issues listed below (or accept a longer downtime window).")
@@ -837,7 +861,10 @@ EOF
 target_is_empty() {
   local n
   case "$TGT_ENGINE" in
-    postgres) n="$(q tgt "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname IN ($(pg_schema_list))")" ;;
+    postgres)
+      local sl; sl="$(pg_schema_list)"
+      if is_xengine; then x_init; sl="'$TGT_SCHEMA'"; fi
+      n="$(q tgt "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname IN ($sl)")" ;;
     mariadb|mysql) n="$(QDB='' q tgt "SELECT (SELECT count(*) FROM information_schema.tables WHERE table_schema = '$TGT_DB') + (SELECT count(*) FROM information_schema.routines WHERE routine_schema = '$TGT_DB')")" ;;
     mongodb) n="$(js tgt 'print(db.getCollectionNames().filter(n => !n.startsWith("system.")).length)')" ;;
   esac
@@ -958,6 +985,18 @@ cmd_full_load() {
   load_assessment
   load_plan
   local phase="${OPT_PHASE:-test}" mode=full coords=0
+  if is_xengine; then
+    log "full load ($phase, cross-engine): $SRC_ENGINE $SRC_HOST/$SRC_DB → $TGT_ENGINE $TGT_HOST/$TGT_DB"
+    target_is_empty || die "the target already contains objects in the migrated schema/database. Load only into an empty target (drop it and recreate it for a re-test)."
+    local t0 secs; t0="$(now)"
+    echo full > "$STATE/load.mode"; echo "$phase" > "$STATE/phase"
+    record_run "$phase" "full-load-started" 0 0 "-"
+    x_full_load
+    secs=$(( $(now) - t0 )); [ "$secs" -ge 1 ] || secs=1
+    record_run "$phase" "full-load" "$secs" "${SIZE_BYTES:-0}" ok
+    ok "full load done in ${secs}s ($(hb $(( ${SIZE_BYTES:-0} / secs )))/s)"
+    return 0
+  fi
   if [ "$STRATEGY" = "full-load+cdc" ]; then
     case "$SRC_ENGINE" in
       postgres) mode=schema ;;
@@ -1055,7 +1094,7 @@ cdc_start_mysqlish() {
 
 cmd_cdc() {
   local sub="${1:-}"
-  require_supported_pair
+  ! is_xengine || die "there is no CDC between different engines ($SRC_ENGINE → $TGT_ENGINE) in this tool — cross-engine migrations are full load only"
   case "$sub" in
     start)
       load_assessment
@@ -1207,7 +1246,7 @@ objects() { # objects <side> — "kind|count" lines
 }
 
 cmd_validate() {
-  require_supported_pair
+  if is_xengine; then x_validate; return $?; fi
   local out="$STATE/validation.md" fail=0 n t s d
   C_ENGINE_OF="$SRC_ENGINE"
   log "validating: row counts$( [ "${OPT_CHECKSUM:-0}" = 1 ] && echo ' and checksums' ) and object counts, source vs target"
@@ -1413,6 +1452,8 @@ cmd_init() {
 usage() {
   cat <<EOF
 $PROG — move a whole database (schema + data) between servers, end to end.
+Same engine or different engines (postgres, mariadb, mysql, mongodb in any
+direction); different engines are converted by this tool, full load only.
 
 Usage: $PROG <command> <config> [options]
 
@@ -1430,7 +1471,8 @@ Usage: $PROG <command> <config> [options]
   Steps on their own:
      full-load <config>    dump the source and load the (empty) target
      cdc start|status|wait|stop <config>
-     validate  <config>    compare row counts and objects  (--checksum: content)
+     validate  <config>    compare row counts and objects  (--checksum: content;
+                           across engines: per-column sums and text lengths)
      report    <config>    every timed run so far
 
 Options:
