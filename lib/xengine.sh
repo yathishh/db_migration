@@ -34,7 +34,11 @@ x_init() {
   TGT_SCHEMA="${TGT_SCHEMA:-public}"
   valid TGT_SCHEMA "$TGT_SCHEMA" '^[A-Za-z0-9_]+$'
   TINYINT1_AS_BOOL="${TINYINT1_AS_BOOL:-true}"
-  MYSQL_TGT_COLLATION="${MYSQL_TGT_COLLATION:-utf8mb4_bin}"
+  # Keep the source's text semantics: PostgreSQL and MongoDB compare text
+  # case-sensitively (_bin); MySQL/MariaDB sources were case-insensitive, and
+  # utf8mb4_unicode_ci exists on both (their own defaults do not).
+  if is_my "$SRC_ENGINE"; then MYSQL_TGT_COLLATION="${MYSQL_TGT_COLLATION:-utf8mb4_unicode_ci}"
+  else MYSQL_TGT_COLLATION="${MYSQL_TGT_COLLATION:-utf8mb4_bin}"; fi
   valid MYSQL_TGT_COLLATION "$MYSQL_TGT_COLLATION" '^[A-Za-z0-9_]+$'
 }
 
@@ -294,9 +298,24 @@ x_extract() {
 
 # ── 2. type and default conversion ──────────────────────────────────────────
 
-# x_type <gtype> <len> <prec> <scale> → target column type
+# MariaDB ⇄ MySQL share almost every column type, so the exact source type is
+# kept (unsigned, enum/set lists, display widths, TIMESTAMP vs DATETIME, fsp).
+# Only the types one of them lacks are mapped.
+x_my_passthru() {
+  local s="${1% (generated)}"; s="${s% (on update)}"; s="${s% (generated)}"
+  case "${s,,}" in
+    uuid) echo "CHAR(36)" ;;
+    inet4|inet6) echo "VARCHAR(45)" ;;
+    vector*) echo LONGTEXT ;;
+    *) echo "$s" ;;
+  esac
+}
+my_family_pair() { is_my "$SRC_ENGINE" && is_my "$TGT_ENGINE"; }
+
+# x_type <gtype> <len> <prec> <scale> [source type] → target column type
 x_type() {
-  local g="$1" len="$2" prec="$3" scale="$4"
+  local g="$1" len="$2" prec="$3" scale="$4" stype="${5:-}"
+  if my_family_pair && [ -n "$stype" ]; then x_my_passthru "$stype"; return; fi
   case "$TGT_ENGINE" in
     postgres)
       case "$g" in
@@ -330,7 +349,12 @@ x_type() {
 
 # Does this target type hold its data out of row (no literal DEFAULT in MySQL,
 # needs a prefix to be indexed)?
-x_my_lob() { case "$1" in LONGTEXT|LONGBLOB|JSON) return 0;; esac; return 1; }
+x_my_lob() {
+  case "${1^^}" in
+    TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT|TINYBLOB|BLOB|MEDIUMBLOB|LONGBLOB|JSON|GEOMETRY*|POINT*|LINESTRING*|POLYGON*|MULTI*) return 0 ;;
+  esac
+  return 1
+}
 
 # x_default <gtype> <raw default> <target type> → " DEFAULT …" or nothing
 x_default() {
@@ -382,7 +406,9 @@ x_default() {
         N) echo " DEFAULT $val" ;;
         B) [ "$val" = true ] && echo " DEFAULT 1" || echo " DEFAULT 0" ;;
         L) echo " DEFAULT $val" ;;
-        F) if [ "$val" = ts ] && [[ "$tt" == DATETIME* ]]; then echo " DEFAULT CURRENT_TIMESTAMP(6)"
+        F) # The default's precision must equal the column's (DATETIME(6) ↔ CURRENT_TIMESTAMP(6)).
+           if [ "$val" = ts ] && [[ "${tt^^}" =~ ^(DATETIME|TIMESTAMP)(\(([0-9])\))? ]]; then
+             echo " DEFAULT CURRENT_TIMESTAMP${BASH_REMATCH[2]}"
            elif [ "$val" = date ]; then echo " DEFAULT (CURRENT_DATE)"
            else printf 'D\n' >&3; fi ;;
       esac ;;
@@ -391,17 +417,18 @@ x_default() {
 
 # Columns of one table: lines of columns.txt
 x_cols() { awk -F'|' -v t="$1" '$2 == t' "$X/columns.txt"; }
-x_coltype() { awk -F'|' -v t="$1" -v c="$2" '$2 == t && $3 == c { print $4 "|" $5; exit }' "$X/columns.txt"; }
+x_coltype() { awk -F'|' -v t="$1" -v c="$2" '$2 == t && $3 == c { print $4 "|" $5 "|" $10; exit }' "$X/columns.txt"; }
 
 # Index column for MySQL: LOBs need a prefix; JSON cannot be indexed.
 x_my_idxcol() { # <table> <col> → `col`[(n)] or empty when not indexable
-  local gl g len tt
-  gl="$(x_coltype "$1" "$2")"; g="${gl%%|*}"; len="${gl##*|}"
-  tt="$(x_type "$g" "$len" 0 0)"
-  case "$tt" in
+  local g len st tt
+  IFS='|' read -r g len st <<<"$(x_coltype "$1" "$2")"
+  tt="$(x_type "$g" "$len" 0 0 "$st")"
+  case "${tt^^}" in
     JSON) return 1 ;;
-    LONGTEXT|LONGBLOB) printf '%s(191)' "$(my_id "$2")"; return 2 ;;
-    VARCHAR\(*) if [ "$len" -gt 768 ]; then printf '%s(768)' "$(my_id "$2")"; return 2; fi ;;
+    GEOMETRY*|POINT*|LINESTRING*|POLYGON*|MULTI*) return 1 ;;
+    *TEXT|*BLOB) printf '%s(191)' "$(my_id "$2")"; return 2 ;;
+    VARCHAR\(*|VARBINARY\(*) if [ "$len" -gt 768 ]; then printf '%s(768)' "$(my_id "$2")"; return 2; fi ;;
   esac
   my_id "$2"
 }
@@ -433,7 +460,7 @@ x_render_table() {
   ref="$(x_tgt_ref "$t")"
   local pkcols; pkcols="$(awk -F'|' -v t="$t" '$1 == t { print $2; exit }' "$X/pk.txt")"
   while IFS='|' read -r srcref tn col g len prec scale nul auto stype def; do
-    tt="$(x_type "$g" "$len" "$prec" "$scale")"
+    tt="$(x_type "$g" "$len" "$prec" "$scale" "$stype")"
     printf '%s|%s\n' "$stype" "$tt" >> "$X/typemap.txt"
     if [ "$SRC_ENGINE" = mongodb ]; then
       # _id derived from the document, so the load only writes `doc`.
@@ -448,7 +475,7 @@ x_render_table() {
       fi
       continue
     fi
-    case "$g" in
+    my_family_pair || case "$g" in
       dec) [ "$prec" -gt 0 ] || [ "$TGT_ENGINE" = postgres ] || xwarn "$t.$col: unbounded numeric becomes DECIMAL(65,30) — values beyond that precision fail to load." ;;
       time) [[ "$stype" != *"with time zone"* ]] || xwarn "$t.$col: time with time zone loses its offset." ;;
       tstz) is_my "$TGT_ENGINE" && xwarn "$t.$col: timestamp with time zone becomes DATETIME(6) holding UTC." ;;
@@ -460,8 +487,11 @@ x_render_table() {
       interval) is_my "$TGT_ENGINE" && xwarn "$t.$col: interval migrated as text." ;;
     esac
     [[ "$stype" != *"(generated)"* ]] || xwarn "$t.$col: generated column — its computed values are copied, the expression is not (re-create it by hand)."
-    [[ "$stype" != *"(on update)"* ]] || xwarn "$t.$col: ON UPDATE CURRENT_TIMESTAMP has no column-level equivalent on PostgreSQL — needs a trigger."
-    if [ "$g" = time ] && is_my "$SRC_ENGINE"; then xwarn "$t.$col: MySQL TIME may hold values beyond 24h or negative; PostgreSQL time cannot (such rows fail to load)."; fi
+    [[ "$stype" != *"(on update)"* ]] || my_family_pair || xwarn "$t.$col: ON UPDATE CURRENT_TIMESTAMP has no column-level equivalent on $TGT_ENGINE — needs a trigger."
+    if my_family_pair; then
+      case "${stype,,}" in uuid*|inet*|vector*) xwarn "$t.$col: $SRC_ENGINE type $stype does not exist on $TGT_ENGINE — becomes $tt." ;; esac
+    fi
+    if [ "$g" = time ] && is_my "$SRC_ENGINE" && [ "$TGT_ENGINE" = postgres ]; then xwarn "$t.$col: MySQL TIME may hold values beyond 24h or negative; PostgreSQL time cannot (such rows fail to load)."; fi
     local line
     if [ "$TGT_ENGINE" = postgres ]; then line="$(pg_id "$col") $tt"; else line="$(my_id "$col") $tt"; fi
     if [ "$auto" = Y ]; then
@@ -479,11 +509,15 @@ x_render_table() {
         *) xwarn "$t.$col: auto-increment on a non-integer column is not converted." ;;
       esac
     fi
-    [ "$nul" = Y ] || line+=" NOT NULL"
+    # Explicit NULL: an old-style MySQL/MariaDB TIMESTAMP column is otherwise NOT NULL.
+    if [ "$nul" = Y ]; then is_my "$TGT_ENGINE" && line+=" NULL"; else line+=" NOT NULL"; fi
     d="$( { x_default "$g" "$def" "$tt" 3> "$X/.dflag"; } )"
     if [ -s "$X/.dflag" ]; then xwarn "$t.$col: default '$def' has no equivalent on $TGT_ENGINE and was dropped."; fi
     rm -f "$X/.dflag"
     line+="$d"
+    if my_family_pair && [[ "$stype" == *"(on update)"* ]] && [[ "${tt^^}" =~ ^(DATETIME|TIMESTAMP)(\(([0-9])\))? ]]; then
+      line+=" ON UPDATE CURRENT_TIMESTAMP${BASH_REMATCH[2]}"
+    fi
     if [ "$TGT_ENGINE" = postgres ] && [[ "$stype" =~ ^enum\((.*)\)$ ]]; then
       line+=" CHECK ($(pg_id "$col") IN (${BASH_REMATCH[1]}))"
     fi
@@ -677,6 +711,9 @@ x_write_report() {
         echo "- Zero dates (\`0000-00-00\`) cannot exist in PostgreSQL and are loaded as NULL (a NOT NULL column with zero dates fails to load)."
         echo "- \`TINYINT(1)\` becomes boolean (TINYINT1_AS_BOOL=$TINYINT1_AS_BOOL); a value other than 0/1 fails to load — set TINYINT1_AS_BOOL=false to keep it numeric."
         echo "- MySQL \`TIMESTAMP\` values are read in UTC and loaded as \`timestamptz\`; \`DATETIME\` becomes \`timestamp\` (no zone)." ;;
+      mariadb/mysql|mysql/mariadb)
+        echo "- Column types are kept exactly; tables get the target collation \`$MYSQL_TGT_COLLATION\` (MYSQL_TGT_COLLATION) because the two engines' default collations do not exist on each other."
+        echo "- MariaDB-only features (sequences, system-versioned tables, UUID/INET types) and MySQL-only ones (functional indexes, CHECK semantics before 8.0.16) need attention." ;;
       mongodb/*)
         echo "- Applications move from the MongoDB query language to SQL over a JSON column — this is an application change, not only a data move." ;;
       */mongodb)
@@ -795,7 +832,10 @@ x_copy_table() {
       while IFS='|' read -r _ _ col g _; do
         local c v; c="$(my_id "$col")"
         case "$g" in
-          int2|int4|int8|uint8|dec|float4|float8|bool|time) v="CAST($c AS CHAR)" ;;
+          int2|int4|int8|uint8|dec|float8|bool|time) v="CAST($c AS CHAR)" ;;
+          # FLOAT prints with 6 significant digits, which is not the stored
+          # value; widened to DOUBLE it prints exactly what is stored.
+          float4) v="CAST(($c + 0E0) AS CHAR)" ;;
           bit) v="CAST($c + 0 AS CHAR)" ;;
           bytes) v="$(tpl "$TPL_MY_HEX" "$c")" ;;
           date) v="IF(CAST($c AS CHAR) LIKE '0000-00-00%', NULL, DATE_FORMAT($c, '%Y-%m-%d'))" ;;
@@ -812,6 +852,26 @@ x_copy_table() {
         | ( use tgt; export DBM_SQL="COPY $(x_tgt_ref "$t") ($cols) FROM STDIN"
             client postgres 'psql -X -q -v ON_ERROR_STOP=1 -h "$DBM_H" -p "$DBM_P" -U "$DBM_U" -d "$DBM_D" -c "$DBM_SQL"' ) ;;
 
+    mariadb/mysql|mysql/mariadb)
+      # Same type system: every value as a MySQL literal, exact. QUOTE() escapes
+      # \ ' NUL and ^Z; newlines are escaped too so one row stays one line.
+      while IFS='|' read -r _ _ col g _; do
+        local c v; c="$(my_id "$col")"
+        case "$g" in
+          int2|int4|int8|uint8|dec|float8|bool) v="CAST($c AS CHAR)" ;;
+          float4) v="CAST(($c + 0E0) AS CHAR)" ;;
+          bit) v="CAST($c + 0 AS CHAR)" ;;
+          bytes|geom) v="CONCAT('X''', HEX($c), '''')" ;;
+          *) v="REPLACE(REPLACE(QUOTE(CAST($c AS CHAR)), '\\n', '\\\\n'), '\\r', '\\\\r')" ;;
+        esac
+        exprs+="${exprs:+, ',', }IF($c IS NULL, 'NULL', $v)"
+        cols+="${cols:+,}$(my_id "$col")"
+      done < <(x_cols "$t")
+      sql="SET SESSION sql_mode = ''; SET SESSION time_zone = '+00:00'; SELECT CONCAT('(', $exprs, ')') FROM $srcref"
+      ( use src; export DBM_SQL="$sql"; client "$SRC_ENGINE" "$(x_my_dump_cmd)" ) \
+        | x_batch_inserts "INSERT INTO $(my_id "$t") ($cols) VALUES " \
+        | ( use tgt; client "$TGT_ENGINE" "$(x_my_load_cmd)" ) ;;
+
     postgres/mongodb)
       while IFS='|' read -r _ _ col g _; do
         local c v; c="$(pg_id "$col")"
@@ -825,7 +885,9 @@ x_copy_table() {
           json) v="$c::json" ;;
           array) v="array_to_json($c)" ;;
           # Typed explicitly: a plain JSON 1.0 would arrive as an int.
-          float4|float8) v="CASE WHEN $c IS NULL THEN NULL ELSE json_build_object('\$numberDouble', $c::text) END" ;;
+          # real is widened first: its own text form is the shortest decimal
+          # that rounds back to float32, not the value a double should hold.
+          float4|float8) v="CASE WHEN $c IS NULL THEN NULL ELSE json_build_object('\$numberDouble', $c::float8::text) END" ;;
           bool|int2|int4) v="$c" ;;
           *) v="$c::text" ;;
         esac
@@ -852,7 +914,8 @@ x_copy_table() {
           geom) v="ST_AsText($c)" ;;
           time) v="CAST($c AS CHAR)" ;;
           bool) v="IF($c IS NULL, NULL, IF($c <> 0, JSON_EXTRACT('true', '\$'), JSON_EXTRACT('false', '\$')))" ;;
-          float4|float8) v="IF($c IS NULL, NULL, JSON_OBJECT('\$numberDouble', CAST($c AS CHAR)))" ;;
+          float4) v="IF($c IS NULL, NULL, JSON_OBJECT('\$numberDouble', CAST(($c + 0E0) AS CHAR)))" ;;
+          float8) v="IF($c IS NULL, NULL, JSON_OBJECT('\$numberDouble', CAST($c AS CHAR)))" ;;
           *) v="$c" ;;
         esac
         exprs+="${exprs:+, }$n, $v"

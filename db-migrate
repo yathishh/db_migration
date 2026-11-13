@@ -126,6 +126,7 @@ load_config() {
   done
   REPL_HOST="${REPL_HOST:-$SRC_HOST}"; REPL_PORT="${REPL_PORT:-$SRC_PORT}"
   REPL_USER="${REPL_USER:-$SRC_USER}"
+  load_transport_security
 
   valid MIGRATION_NAME "$MIGRATION_NAME" '^[a-z0-9_]+$'
   valid PURPOSE "$PURPOSE" '^(migration|replication)$'
@@ -149,11 +150,61 @@ load_config() {
   fi
 }
 
-same_family() { # mariadb and mysql can exchange dumps (with care); others must match
-  [ "$SRC_ENGINE" = "$TGT_ENGINE" ] && return 0
-  case "$SRC_ENGINE/$TGT_ENGINE" in mariadb/mysql|mysql/mariadb) return 0;; esac
-  return 1
+# ── encryption in transit ───────────────────────────────────────────────────
+#
+# Every connection is TLS-encrypted by default, and nothing silently falls
+# back to plain text:
+#
+#   require  (default) encrypted; refuses to run if the server cannot do TLS
+#   verify   encrypted AND the server's certificate is checked against
+#            <SIDE>_SSL_CA (hostname included) — stops man-in-the-middle too
+#   disable  plain text — only with ALLOW_INSECURE_TRANSPORT=yes
+#
+# "prefer" is deliberately not accepted: it quietly downgrades to plain text
+# when the server does not offer TLS, which is exactly the failure to prevent.
+# The same applies to the CDC connection the TARGET server opens to the
+# source (REPL_SSL, REPL_SSL_CA_PATH).
+load_transport_security() {
+  local side var mode ca
+  for side in SRC TGT; do
+    var="${side}_SSL"; mode="${!var:-require}"; printf -v "$var" '%s' "$mode"
+    case "$mode" in
+      require|verify) ;;
+      prefer) die "$var=prefer can silently fall back to plain text. Use require (the default) or verify." ;;
+      disable)
+        [ "${ALLOW_INSECURE_TRANSPORT:-no}" = yes ] \
+          || die "$var=disable sends data and passwords in plain text. Refused unless ALLOW_INSECURE_TRANSPORT=yes is set explicitly." ;;
+      *) die "$var must be require, verify or disable (got '$mode')" ;;
+    esac
+    var="${side}_SSL_CA"; ca="${!var:-}"
+    printf -v "${side}_SSL_CA_PEM" '%s' ""
+    if [ "$mode" = verify ]; then
+      [ -n "$ca" ] || die "${side}_SSL=verify needs ${side}_SSL_CA=/path/to/ca.pem (e.g. the AWS RDS global bundle, or your system bundle /etc/ssl/certs/ca-certificates.crt for public CAs)"
+      [ -r "$ca" ] || die "${side}_SSL_CA: cannot read '$ca'"
+      grep -q -- '-----BEGIN CERTIFICATE-----' "$ca" || die "${side}_SSL_CA: '$ca' is not a PEM certificate bundle"
+      printf -v "${side}_SSL_CA_PEM" '%s' "$(cat "$ca")"
+    fi
+  done
+  REPL_SSL="${REPL_SSL:-require}"
+  case "$REPL_SSL" in
+    require) ;;
+    verify) [ -n "${REPL_SSL_CA_PATH:-}" ] || die "REPL_SSL=verify needs REPL_SSL_CA_PATH — the CA file's path ON THE TARGET SERVER" ;;
+    disable) [ "${ALLOW_INSECURE_TRANSPORT:-no}" = yes ] || die "REPL_SSL=disable is refused unless ALLOW_INSECURE_TRANSPORT=yes" ;;
+    *) die "REPL_SSL must be require, verify or disable" ;;
+  esac
+  [ -z "${REPL_SSL_CA_PATH:-}" ] || valid REPL_SSL_CA_PATH "$REPL_SSL_CA_PATH" '^[A-Za-z0-9_./-]+$'
+  # The data stream runs through the Docker API. A remote daemon over plain
+  # TCP would carry every row unencrypted across the network.
+  if [[ "${DOCKER_HOST:-}" == tcp://* ]] && [ "${DOCKER_TLS_VERIFY:-}" != 1 ] && [ "${ALLOW_INSECURE_TRANSPORT:-no}" != yes ]; then
+    die "DOCKER_HOST=$DOCKER_HOST without DOCKER_TLS_VERIFY=1 would stream the data unencrypted to the Docker daemon. Use TLS (or ssh://), or CLIENT_MODE=local."
+  fi
 }
+
+# Only the same engine uses its own dump tools. MariaDB ⇄ MySQL looks close
+# enough for a raw dump, but each has collations, types and syntax the other
+# rejects (utf8mb4_uca1400_ai_ci, utf8mb4_0900_ai_ci, UUID, sequences), so it
+# goes through the converter with exact type passthrough instead.
+same_family() { [ "$SRC_ENGINE" = "$TGT_ENGINE" ]; }
 homogeneous() { [ "$SRC_ENGINE" = "$TGT_ENGINE" ]; }
 
 # Every engine pair is supported: same engine / same family by native dump
@@ -170,8 +221,25 @@ require_supported_pair() { :; }
 # a command line: no quoting bugs, no injection, and no password in `ps`.
 
 CLIENT_ENVS=(PGPASSWORD PGSSLMODE MYSQL_PWD MONGO_URI MONGO_JS MONGO_CFG_YAML
-             DBM_SQL DBM_H DBM_P DBM_U DBM_D DBM_TLS DBM_SRCDB
-             DBM_H2 DBM_P2 DBM_U2 DBM_D2 DBM_PW2 DBM_TLS2)
+             DBM_SQL DBM_H DBM_P DBM_U DBM_D DBM_TLS DBM_SRCDB DBM_CA
+             DBM_H2 DBM_P2 DBM_U2 DBM_D2 DBM_PW2 DBM_TLS2 DBM_CA2)
+
+# Runs first in every client shell. The CA bundle arrives as text in DBM_CA
+# (no bind mount needed, so it works with any Docker daemon) and is written to
+# a private temp file; "@CA@" in the TLS options and the MongoDB URI is then
+# replaced by that file's path. DBM_CA2 is the target's, for the one command
+# that talks to both sides (parallel pg_dump → pg_restore).
+TLS_PREFIX='umask 077; DBM_CAF=; DBM_CAF2=;
+if [ -n "${DBM_CA:-}" ]; then
+  DBM_CAF=$(mktemp); printf "%s\n" "$DBM_CA" > "$DBM_CAF"; export PGSSLROOTCERT="$DBM_CAF"
+  DBM_TLS=$(printf "%s" "$DBM_TLS" | sed "s#@CA@#$DBM_CAF#g")
+  MONGO_URI=$(printf "%s" "${MONGO_URI:-}" | sed "s#@CA@#$DBM_CAF#g")
+  MONGO_CFG_YAML=$(printf "%s" "${MONGO_CFG_YAML:-}" | sed "s#@CA@#$DBM_CAF#g")
+  export DBM_TLS MONGO_URI MONGO_CFG_YAML
+fi
+if [ -n "${DBM_CA2:-}" ]; then DBM_CAF2=$(mktemp); printf "%s\n" "$DBM_CA2" > "$DBM_CAF2"; fi
+trap "rm -f \"\$DBM_CAF\" \"\$DBM_CAF2\"" EXIT
+'
 
 engine_image() {
   case "$1" in postgres) echo "$PG_IMAGE";; mariadb) echo "$MARIADB_IMAGE";; mysql) echo "$MYSQL_IMAGE";; mongodb) echo "$MONGO_IMAGE";; esac
@@ -181,13 +249,13 @@ engine_image() {
 client() {
   local engine="$1"; shift
   if [ "$CLIENT_MODE" = local ]; then
-    sh -c "$*"
+    sh -c "$TLS_PREFIX$*"
   else
     local -a envs=(); local v
     for v in "${CLIENT_ENVS[@]}"; do envs+=(-e "$v"); done
     # -i and never -t: a TTY would rewrite the binary dump stream.
     docker run --rm -i --network "$DOCKER_NETWORK" --user "$(id -u):$(id -g)" \
-      "${envs[@]}" -e HOME=/tmp --entrypoint sh "$(engine_image "$engine")" -c "$*"
+      "${envs[@]}" -e HOME=/tmp --entrypoint sh "$(engine_image "$engine")" -c "$TLS_PREFIX$*"
   fi
 }
 
@@ -201,7 +269,8 @@ use() {
   v="${p}_PORT";   C_PORT="${!v}"
   v="${p}_USER";   C_USER="${!v}"
   v="${p}_DB";     C_DB="${!v}"
-  v="${p}_SSL";    ssl="${!v:-prefer}"
+  v="${p}_SSL";    ssl="${!v}"
+  v="${p}_SSL_CA_PEM"; export DBM_CA="${!v}"
   v="${p}_PASSWORD"; pw="${!v:-}"
   local uri_var="${p}_MONGO_URI"
   if [ -z "$pw" ] && ! { [ "$C_ENGINE" = mongodb ] && [ -n "${!uri_var:-}" ]; }; then
@@ -215,21 +284,33 @@ use() {
       export PGPASSWORD="$pw" PGSSLMODE="$ssl" ;;
     mariadb)
       export MYSQL_PWD="$pw"
-      case "$ssl" in require) DBM_TLS="--ssl --ssl-verify-server-cert=0";; verify) DBM_TLS="--ssl --ssl-verify-server-cert";; disable) DBM_TLS="--skip-ssl";; *) DBM_TLS="--ssl-verify-server-cert=0";; esac ;;
+      case "$ssl" in
+        require) DBM_TLS="--ssl --ssl-verify-server-cert=0" ;;
+        verify)  DBM_TLS="--ssl --ssl-ca=@CA@ --ssl-verify-server-cert" ;;
+        disable) DBM_TLS="--skip-ssl" ;;
+      esac ;;
     mysql)
       export MYSQL_PWD="$pw"
-      case "$ssl" in require) DBM_TLS="--ssl-mode=REQUIRED";; verify) DBM_TLS="--ssl-mode=VERIFY_IDENTITY";; disable) DBM_TLS="--ssl-mode=DISABLED";; *) DBM_TLS="--ssl-mode=PREFERRED";; esac
-      # MySQL 8's default caching_sha2_password refuses a non-TLS login unless
-      # the client may fetch the server's RSA key to protect the password.
-      DBM_TLS+=" --get-server-public-key" ;;
+      case "$ssl" in
+        require) DBM_TLS="--ssl-mode=REQUIRED" ;;
+        verify)  DBM_TLS="--ssl-mode=VERIFY_IDENTITY --ssl-ca=@CA@" ;;
+        # caching_sha2_password refuses a plain-text login unless the client
+        # may fetch the server's RSA key to protect the password.
+        disable) DBM_TLS="--ssl-mode=DISABLED --get-server-public-key" ;;
+      esac ;;
     mongodb)
       if [ -n "${!uri_var:-}" ]; then
         MONGO_URI="${!uri_var}"
+        if [ "$ssl" != disable ] && [[ "$MONGO_URI" != mongodb+srv://* ]] && ! [[ "$MONGO_URI" =~ [?\&](tls|ssl)=true ]]; then
+          die "${uri_var} does not enable TLS. Add tls=true to it (or use mongodb+srv://, which implies TLS)."
+        fi
       else
         local adb_var="${p}_AUTH_DB"
         MONGO_URI="mongodb://$(urlenc "$C_USER"):$(urlenc "$pw")@${C_HOST}:${C_PORT}/?authSource=${!adb_var:-admin}"
-        case "$ssl" in require|verify) MONGO_URI+="&tls=true";; esac
-        [ "$ssl" = require ] && MONGO_URI+="&tlsAllowInvalidCertificates=true"
+        case "$ssl" in
+          require) MONGO_URI+="&tls=true&tlsAllowInvalidCertificates=true" ;;
+          verify)  MONGO_URI+="&tls=true&tlsCAFile=@CA@" ;;
+        esac
       fi
       export MONGO_URI
       MONGO_CFG_YAML="uri: '$(printf '%s' "$MONGO_URI" | sed "s/'/''/g")'"; export MONGO_CFG_YAML ;;
@@ -238,7 +319,7 @@ use() {
 }
 
 # mongo tools read the URI from a private temp file, never from argv.
-MCFG='umask 077; c=$(mktemp); trap "rm -f \"$c\"" EXIT; printf "%s\n" "$MONGO_CFG_YAML" > "$c";'
+MCFG='umask 077; c=$(mktemp); trap "rm -f \"$c\" \"$DBM_CAF\" \"$DBM_CAF2\"" EXIT; printf "%s\n" "$MONGO_CFG_YAML" > "$c";'
 
 # q <side> <sql> — rows on stdout, columns separated by '|'.
 # Set QDB= (empty) to connect a MariaDB/MySQL client without a default database.
@@ -550,6 +631,33 @@ assess_mongodb() {
   fi
 }
 
+# assess_transport <src|tgt> — ask the SERVER what protects this session, so
+# the report shows evidence, not intent. Unencrypted when it should not be
+# is a blocker.
+assess_transport() {
+  local side="$1" P mode got=""
+  P="$( [ "$side" = src ] && echo SRC || echo TGT )"; mode="${P}_SSL"; mode="${!mode}"
+  case "$( [ "$side" = src ] && echo "$SRC_ENGINE" || echo "$TGT_ENGINE" )" in
+    postgres)
+      got="$(q "$side" "SELECT coalesce((SELECT version || ' ' || cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid() AND ssl), '')" 2>/dev/null || true)" ;;
+    mariadb|mysql)
+      got="$(QDB='' q "$side" "SHOW SESSION STATUS WHERE Variable_name IN ('Ssl_version', 'Ssl_cipher')" 2>/dev/null \
+             | awk -F'|' '$2 != "" { v[$1] = $2 } END { if (v["Ssl_version"] != "") print v["Ssl_version"] " " v["Ssl_cipher"] }' || true)" ;;
+    mongodb)
+      # The driver refuses to connect without TLS when tls=true, so a working
+      # connection in require/verify mode is itself the evidence.
+      [ "$mode" = disable ] || got="TLS (enforced by the client: tls=true$( [ "$mode" = verify ] && echo ', certificate verified' ))" ;;
+  esac
+  A[${P}_TLS]="${got:-none}"
+  if [ -n "$got" ]; then
+    ok "$side connection encrypted: $got$( [ "$mode" = verify ] && echo ' — server certificate verified' )"
+  elif [ "$mode" = disable ]; then
+    WARNINGS+=("$side connection is NOT encrypted (${P}_SSL=disable, ALLOW_INSECURE_TRANSPORT=yes): data and credentials cross the network in plain text.")
+  else
+    BLOCKERS+=("$side connection is not encrypted although ${P}_SSL=$mode — check the server's TLS configuration.")
+  fi
+}
+
 cmd_assess() {
   rm -f "$STATE/top_tables.txt" "$STATE/no_pk.txt" "$STATE/lob_columns.txt" "$STATE/lob_max.txt"
   log "Assessing '$MIGRATION_NAME': $SRC_ENGINE $SRC_HOST/$SRC_DB → $TGT_ENGINE $TGT_HOST/$TGT_DB  (client: $CLIENT_MODE)"
@@ -564,6 +672,8 @@ cmd_assess() {
   else
     rm -f "$STATE/conversion.md"
   fi
+  assess_transport src
+  [ -z "${A[TGT_VERSION]:-}" ] || assess_transport tgt
 
   # Character encoding (requirement: garbled text with non-Unicode sources)
   case "${A[SRC_ENCODING]:-}" in
@@ -621,6 +731,7 @@ write_assessment_md() {
     echo "| Endpoint | \`$SRC_HOST:$SRC_PORT/$SRC_DB\` | \`$TGT_HOST:$TGT_PORT/$TGT_DB\` |"
     echo "| Version | ${A[SRC_VERSION]:-?} | ${A[TGT_VERSION]:-not reachable} |"
     echo "| Encoding / collation | ${A[SRC_ENCODING]:-?} ${A[SRC_COLLATION]:+/ ${A[SRC_COLLATION]}} | ${A[TGT_ENCODING]:-?} ${A[TGT_COLLATION]:+/ ${A[TGT_COLLATION]}} |"
+    echo "| Encryption in transit (${SRC_SSL} / ${TGT_SSL}) | ${A[SRC_TLS]:-?} | ${A[TGT_TLS]:-?} |"
     echo
     echo "Migration type: **$(homogeneous && echo "homogeneous (same engine) — native tools" || { same_family && echo "same family ($SRC_ENGINE → $TGT_ENGINE) — native tools, full load only" || echo "heterogeneous — schema converted by this tool, full load only (see conversion.md)"; })**."
     echo
@@ -890,11 +1001,13 @@ full_load_postgres() {
   if [ "$JOBS" -gt 1 ] && [ "$mode" = full ]; then
     info "parallel: pg_dump -Fd -j $JOBS and pg_restore -j $JOBS through a temporary directory (needs free space ≈ the dump size $( [ "$CLIENT_MODE" = docker ] && echo 'inside the container' || echo 'in $TMPDIR' ))"
     use tgt
-    export DBM_H2="$DBM_H" DBM_P2="$DBM_P" DBM_U2="$DBM_U" DBM_D2="$DBM_D" DBM_PW2="$PGPASSWORD" DBM_TLS2="$PGSSLMODE"
+    export DBM_H2="$DBM_H" DBM_P2="$DBM_P" DBM_U2="$DBM_U" DBM_D2="$DBM_D" DBM_PW2="$PGPASSWORD" DBM_TLS2="$PGSSLMODE" DBM_CA2="$DBM_CA"
     use src
-    client postgres "d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT
+    # The target gets its own root certificate (or none): with a root file
+    # present, libpq would check the target against the SOURCE's CA.
+    client postgres "d=\$(mktemp -d); trap 'rm -rf \"\$d\" \"\$DBM_CAF\" \"\$DBM_CAF2\"' EXIT
       pg_dump -h \"\$DBM_H\" -p \"\$DBM_P\" -U \"\$DBM_U\" -d \"\$DBM_D\" -Fd -j $JOBS -f \"\$d/dump\" --strict-names $args || exit 90
-      PGPASSWORD=\"\$DBM_PW2\" PGSSLMODE=\"\$DBM_TLS2\" pg_restore -h \"\$DBM_H2\" -p \"\$DBM_P2\" -U \"\$DBM_U2\" -d \"\$DBM_D2\" -j $JOBS $own \"\$d/dump\"" 2> "$errf"
+      PGPASSWORD=\"\$DBM_PW2\" PGSSLMODE=\"\$DBM_TLS2\" PGSSLROOTCERT=\"\${DBM_CAF2:-/nonexistent}\" pg_restore -h \"\$DBM_H2\" -p \"\$DBM_P2\" -U \"\$DBM_U2\" -d \"\$DBM_D2\" -j $JOBS $own \"\$d/dump\"" 2> "$errf"
     st=$?
     [ "$st" -ne 90 ] || { set -e; cat "$errf" >&2; die "pg_dump failed on the source"; }
   else
@@ -1052,8 +1165,15 @@ cdc_start_postgres() {
   tables="$(q src "SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($sl) AND n.nspname || '.' || c.relname NOT IN ($ex)")"
   [ -n "$tables" ] || die "no tables to publish"
 
-  local pw="${REPL_PASSWORD:-${SRC_PASSWORD:-}}" ssl="${SRC_SSL:-prefer}"
-  [ "$ssl" = verify ] && ssl=verify-full
+  # The subscription is a connection FROM THE TARGET SERVER to the source:
+  # encrypted (REPL_SSL=require, default) and, with REPL_SSL_CA_PATH — a path
+  # on the target server — certificate- and hostname-verified.
+  local pw="${REPL_PASSWORD:-${SRC_PASSWORD:-}}" ssl
+  case "$REPL_SSL" in
+    verify)  ssl="verify-full sslrootcert=$(pg_conninfo_val "$REPL_SSL_CA_PATH")" ;;
+    require) ssl=require ;;
+    disable) ssl=disable ;;
+  esac
   local conn="host=$(pg_conninfo_val "$REPL_HOST") port=$REPL_PORT dbname=$(pg_conninfo_val "$SRC_DB") user=$(pg_conninfo_val "$REPL_USER") password=$(pg_conninfo_val "$pw") sslmode=$ssl"
 
   log "source: CREATE PUBLICATION $PUB"
@@ -1076,17 +1196,27 @@ cdc_start_mysqlish() {
   [ -n "$file" ] && [ -n "$pos" ] || die "could not parse $coords"
   local pw="${REPL_PASSWORD:-${SRC_PASSWORD:-}}" sql
   local h; h="$(my_lit "$REPL_HOST")"; local u; u="$(my_lit "$REPL_USER")"; local p; p="$(my_lit "$pw")"
+  # The replica thread is a connection FROM THE TARGET SERVER to the source:
+  # TLS on unless REPL_SSL=disable; certificate-verified with REPL_SSL_CA_PATH.
+  local ssl_m="" ssl_s="" ssl_rds=1
+  case "$REPL_SSL" in
+    require) ssl_m=", MASTER_SSL=1, MASTER_SSL_VERIFY_SERVER_CERT=0"; ssl_s=", SOURCE_SSL=1" ;;
+    verify)  ssl_m=", MASTER_SSL=1, MASTER_SSL_CA='$(my_lit "$REPL_SSL_CA_PATH")', MASTER_SSL_VERIFY_SERVER_CERT=1"
+             ssl_s=", SOURCE_SSL=1, SOURCE_SSL_CA='$(my_lit "$REPL_SSL_CA_PATH")', SOURCE_SSL_VERIFY_SERVER_CERT=1" ;;
+    disable) ssl_m=", MASTER_SSL=0"; ssl_s=", SOURCE_SSL=0, GET_SOURCE_PUBLIC_KEY=1"; ssl_rds=0 ;;
+  esac
   if [ "$TGT_MANAGED" = rds ]; then
+    # last argument of the RDS procedure: ssl_encryption
     if [ "$TGT_ENGINE" = mariadb ]; then
-      sql="CALL mysql.rds_set_external_master('$h', $REPL_PORT, '$u', '$p', '$file', $pos, 0); CALL mysql.rds_start_replication;"
+      sql="CALL mysql.rds_set_external_master('$h', $REPL_PORT, '$u', '$p', '$file', $pos, $ssl_rds); CALL mysql.rds_start_replication;"
     else
-      sql="CALL mysql.rds_set_external_source('$h', $REPL_PORT, '$u', '$p', '$file', $pos, 0); CALL mysql.rds_start_replication;"
+      sql="CALL mysql.rds_set_external_source('$h', $REPL_PORT, '$u', '$p', '$file', $pos, $ssl_rds); CALL mysql.rds_start_replication;"
     fi
     warn "RDS target: set replicate-do-db=$TGT_DB in the target's parameter group, or every database on the source is replicated"
   elif [ "$TGT_ENGINE" = mariadb ]; then
-    sql="STOP SLAVE; SET GLOBAL replicate_do_db = '$(my_lit "$TGT_DB")'; CHANGE MASTER TO MASTER_HOST='$h', MASTER_PORT=$REPL_PORT, MASTER_USER='$u', MASTER_PASSWORD='$p', MASTER_LOG_FILE='$file', MASTER_LOG_POS=$pos; START SLAVE;"
+    sql="STOP SLAVE; SET GLOBAL replicate_do_db = '$(my_lit "$TGT_DB")'; CHANGE MASTER TO MASTER_HOST='$h', MASTER_PORT=$REPL_PORT, MASTER_USER='$u', MASTER_PASSWORD='$p', MASTER_LOG_FILE='$file', MASTER_LOG_POS=$pos$ssl_m; START SLAVE;"
   else
-    sql="STOP REPLICA; CHANGE REPLICATION FILTER REPLICATE_DO_DB = (\`$TGT_DB\`); CHANGE REPLICATION SOURCE TO SOURCE_HOST='$h', SOURCE_PORT=$REPL_PORT, SOURCE_USER='$u', SOURCE_PASSWORD='$p', SOURCE_LOG_FILE='$file', SOURCE_LOG_POS=$pos, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"
+    sql="STOP REPLICA; CHANGE REPLICATION FILTER REPLICATE_DO_DB = (\`$TGT_DB\`); CHANGE REPLICATION SOURCE TO SOURCE_HOST='$h', SOURCE_PORT=$REPL_PORT, SOURCE_USER='$u', SOURCE_PASSWORD='$p', SOURCE_LOG_FILE='$file', SOURCE_LOG_POS=$pos$ssl_s; START REPLICA;"
   fi
   log "target: start replication from $file:$pos (the TARGET server connects to $REPL_HOST:$REPL_PORT)"
   q tgt "$sql" >/dev/null
@@ -1208,8 +1338,18 @@ counts() {
   local chk="${OPT_CHECKSUM:-0}"
   flush() {
     [ -n "$sql" ] || return 0
+    # Fixed session time zone: TIMESTAMP values render in it.
+    case "$C_ENGINE_OF" in mariadb|mysql) sql="SET SESSION time_zone = '+00:00'; $sql" ;; esac
     q "$side" "$sql"; sql=""; n=0
   }
+  # MariaDB/MySQL content hash, as pt-table-checksum does it: MD5 of every
+  # value in each row, folded with BIT_XOR into 128 bits — independent of row
+  # order and storage format, constant memory. (CHECKSUM TABLE is NOT usable:
+  # it hashes the engine's internal row buffer and differs between tables
+  # holding identical data.) Column list taken from the source.
+  if [ "$chk" = 1 ] && [ "$C_ENGINE_OF" != postgres ] && [ ! -s "$STATE/.cols" ]; then
+    q src "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = DATABASE() ORDER BY table_name, ordinal_position" > "$STATE/.cols"
+  fi
   while IFS= read -r t; do
     [ -n "$t" ] || continue
     case "$C_ENGINE_OF" in
@@ -1222,17 +1362,29 @@ counts() {
         fi ;;
       mariadb|mysql)
         lit="$(my_lit "$t")"
-        sql+="${sql:+ UNION ALL }SELECT '$lit', COUNT(*) FROM \`${t//\`/\`\`}\`" ;;
+        if [ "$chk" = 1 ]; then
+          local row="" col dt v
+          while IFS='|' read -r col dt; do
+            case "$dt" in
+              binary|varbinary|tinyblob|blob|mediumblob|longblob|geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|geomcollection)
+                v="HEX(\`${col//\`/\`\`}\`)" ;;
+              *) v="CAST(\`${col//\`/\`\`}\` AS CHAR)" ;;
+            esac
+            # length-prefixed, so ('a#b','c') and ('a','b#c') cannot collide
+            row+="${row:+, }IFNULL(CONCAT(LENGTH($v), ':', $v), 'N')"
+          done < <(awk -F'|' -v t="$t" '$1 == t { print $2 "|" $3 }' "$STATE/.cols")
+          sql+="${sql:+ UNION ALL }SELECT '$lit', CONCAT(COUNT(*), '/',
+            LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTRING(h, 1, 16), 16, 10) AS UNSIGNED))), 16, '0'),
+            LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTRING(h, 17, 16), 16, 10) AS UNSIGNED))), 16, '0'))
+            FROM (SELECT MD5(CONCAT_WS('#', $row)) h FROM \`${t//\`/\`\`}\`) x"
+        else
+          sql+="${sql:+ UNION ALL }SELECT '$lit', COUNT(*) FROM \`${t//\`/\`\`}\`"
+        fi ;;
     esac
     n=$(( n + 1 ))
     [ "$n" -lt 300 ] || flush
   done < "$list"
   flush
-  if [ "$chk" = 1 ] && [ "$C_ENGINE_OF" != postgres ]; then
-    local tl=""
-    while IFS= read -r t; do [ -n "$t" ] && tl+="${tl:+, }\`${t//\`/\`\`}\`"; done < "$list"
-    [ -z "$tl" ] || q "$side" "CHECKSUM TABLE $tl" | sed 's/^[^.|]*\.//' > "$STATE/.chk.$side"
-  fi
 }
 
 objects() { # objects <side> — "kind|count" lines
@@ -1251,7 +1403,7 @@ cmd_validate() {
   C_ENGINE_OF="$SRC_ENGINE"
   log "validating: row counts$( [ "${OPT_CHECKSUM:-0}" = 1 ] && echo ' and checksums' ) and object counts, source vs target"
   local sa="$STATE/.src" ta="$STATE/.tgt"
-  : > "$sa"; : > "$ta"; rm -f "$STATE/.chk.src" "$STATE/.chk.tgt"
+  : > "$sa"; : > "$ta"; rm -f "$STATE/.cols"
 
   if [ "$SRC_ENGINE" = mongodb ]; then
     local jsc
@@ -1264,10 +1416,6 @@ cmd_validate() {
     comm -12 <(sort "$STATE/.tables.src") <(sort "$STATE/.tables.tgt") > "$STATE/.tables.both"
     counts src "$STATE/.tables.both" | sort > "$sa"
     counts tgt "$STATE/.tables.both" | sort > "$ta"
-    if [ -f "$STATE/.chk.src" ]; then
-      join -t'|' <(sort "$sa") <(sort "$STATE/.chk.src") | awk -F'|' '{print $1 "|" $2 "/" $3}' > "$sa.j"; mv "$sa.j" "$sa"
-      join -t'|' <(sort "$ta") <(sort "$STATE/.chk.tgt") | awk -F'|' '{print $1 "|" $2 "/" $3}' > "$ta.j"; mv "$ta.j" "$ta"
-    fi
   fi
 
   {
@@ -1326,7 +1474,7 @@ cmd_validate() {
       else echo "| $n | $s | $d | ❌ |" >> "$out"; fail=$(( fail + 1 )); fi
     done <<<"$so"
   fi
-  rm -f "$sa" "$ta" "$STATE"/.tables.* "$STATE"/.chk.*
+  rm -f "$sa" "$ta" "$STATE"/.tables.* "$STATE/.cols"
 
   echo >> "$out"
   if [ "$fail" -eq 0 ]; then
