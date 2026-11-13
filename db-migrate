@@ -1,0 +1,1490 @@
+#!/usr/bin/env bash
+# db-migrate — move a whole database (schema + data) from one server to another.
+#
+# Follows the five-phase migration workflow:
+#
+#   1. assess / plan   review the requirements: purpose, targets, scale,
+#                      downtime, latency, deadline → a written plan
+#   2. run --phase test       a full test migration into a non-production target
+#   3. plan (again)           re-plan with the throughput the test MEASURED
+#   4. run --phase rehearsal  the same steps, timed, as the real day will run
+#   5. cutover                production: stop writes → catch up → verify → switch
+#
+# Same-engine (homogeneous) migrations only, using each engine's native tools:
+#   postgres   pg_dump/pg_restore, logical replication for CDC
+#   mariadb    mariadb-dump, binlog replication for CDC
+#   mysql      mysqldump,   binlog replication for CDC
+#   mongodb    mongodump/mongorestore (full load only — no native CDC)
+# Cross-engine (e.g. MySQL → Postgres) is detected and refused with a pointer
+# to AWS DMS + DMS Schema Conversion, which is the right tool for that job.
+#
+# Runs anywhere that can reach both databases: a laptop, a bastion, a CI runner.
+# Client tools come from pinned Docker images, or from the local PATH when
+# there is no Docker (CLIENT_MODE=local).
+#
+# Usage: db-migrate <command> <config> [options]     (db-migrate help)
+
+set -euo pipefail
+export LC_ALL=C   # stable sort/comm/join for comparing table lists
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROG="$(basename "$0")"
+
+# Pinned client images. The postgres client must be at least as new as the
+# source SERVER (pg_dump refuses to dump a newer server), so it tracks the
+# newest major; override per migration if your servers are newer still.
+PG_IMAGE="${PG_IMAGE:-postgres:17-alpine}"
+MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4}"
+MONGO_IMAGE="${MONGO_IMAGE:-mongo:7}"
+DOCKER_NETWORK="${DOCKER_NETWORK:-host}"
+
+log()  { printf '▶ %s\n' "$*" >&2; }
+ok()   { printf '  ✅ %s\n' "$*" >&2; }
+info() { printf '  %s\n' "$*" >&2; }
+warn() { printf '  ⚠️  %s\n' "$*" >&2; }
+die()  { printf '❌ %s\n' "$*" >&2; exit 1; }
+
+hb() { # human-readable bytes
+  awk -v b="${1:-0}" 'BEGIN { split("B KB MB GB TB PB", u, " "); i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i] }'
+}
+now() { date +%s; }
+ceil_div() { echo $(( ($1 + $2 - 1) / $2 )); }
+
+# date_add <YYYY-MM-DD> <days> — GNU date, with a BSD/macOS fallback.
+date_add() {
+  date -d "$1 $2 day" +%F 2>/dev/null \
+    || date -j -v"$( [ "$2" -ge 0 ] && echo "+" )$2"d -f %F "$1" +%F 2>/dev/null \
+    || die "cannot do date arithmetic on this system"
+}
+date_days_between() { # days from $1 to $2
+  local a b
+  a="$(date -d "$1" +%s 2>/dev/null || date -j -f %F "$1" +%s)"
+  b="$(date -d "$2" +%s 2>/dev/null || date -j -f %F "$2" +%s)"
+  echo $(( (b - a) / 86400 ))
+}
+
+urlenc() {
+  local s="$1" out="" c i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in [a-zA-Z0-9._~-]) out+="$c" ;; *) out+="$(printf '%%%02X' "'$c")" ;; esac
+  done
+  printf '%s' "$out"
+}
+
+# ── configuration ───────────────────────────────────────────────────────────
+
+valid() { # valid <name> <value> <regex>
+  [[ "$2" =~ $3 ]] || die "$1='$2' contains characters this tool does not accept (allowed: $3)"
+}
+
+load_config() {
+  CONF="${1:-}"
+  [ -n "$CONF" ] || die "no config file given. Create one with: $PROG init <name>"
+  [ -f "$CONF" ] || die "config file '$CONF' not found"
+  # shellcheck source=/dev/null
+  . "$CONF"
+
+  : "${MIGRATION_NAME:?MIGRATION_NAME is required in $CONF}"
+  : "${SRC_ENGINE:?SRC_ENGINE is required in $CONF}"
+  : "${SRC_HOST:?SRC_HOST is required}" "${SRC_USER:?SRC_USER is required}" "${SRC_DB:?SRC_DB is required}"
+  : "${TGT_HOST:?TGT_HOST is required}" "${TGT_USER:?TGT_USER is required}"
+  TGT_ENGINE="${TGT_ENGINE:-$SRC_ENGINE}"
+  TGT_DB="${TGT_DB:-$SRC_DB}"
+  PURPOSE="${PURPOSE:-migration}"
+  SCHEMAS="${SCHEMAS:-public}"
+  EXCLUDE_DATA_TABLES="${EXCLUDE_DATA_TABLES:-}"
+  DOWNTIME_MINUTES="${DOWNTIME_MINUTES:-60}"
+  MAX_LAG_SECONDS="${MAX_LAG_SECONDS:-60}"
+  CDC_MAX_LAG_BYTES="${CDC_MAX_LAG_BYTES:-16777216}"
+  DEADLINE="${DEADLINE:-}"
+  THROUGHPUT_MBPS="${THROUGHPUT_MBPS:-20}"
+  MARGIN_PCT="${MARGIN_PCT:-50}"
+  VALIDATE_MINUTES="${VALIDATE_MINUTES:-15}"
+  SWITCH_MINUTES="${SWITCH_MINUTES:-15}"
+  JOBS="${JOBS:-1}"
+  TGT_MANAGED="${TGT_MANAGED:-none}"
+  STRIP_DEFINERS="${STRIP_DEFINERS:-true}"
+  PG_KEEP_OWNERSHIP="${PG_KEEP_OWNERSHIP:-false}"
+  SAMPLE_SECONDS="${SAMPLE_SECONDS:-60}"
+  CUTOVER_WAIT_MINUTES="${CUTOVER_WAIT_MINUTES:-30}"
+
+  local e
+  for e in "$SRC_ENGINE" "$TGT_ENGINE"; do
+    case "$e" in postgres|mariadb|mysql|mongodb) ;; *) die "unknown engine '$e' (postgres|mariadb|mysql|mongodb)";; esac
+  done
+  for e in SRC TGT; do
+    local v="${e}_ENGINE" p="${e}_PORT"
+    if [ -z "${!p:-}" ]; then
+      case "${!v}" in postgres) printf -v "$p" 5432;; mariadb|mysql) printf -v "$p" 3306;; mongodb) printf -v "$p" 27017;; esac
+    fi
+  done
+  REPL_HOST="${REPL_HOST:-$SRC_HOST}"; REPL_PORT="${REPL_PORT:-$SRC_PORT}"
+  REPL_USER="${REPL_USER:-$SRC_USER}"
+
+  valid MIGRATION_NAME "$MIGRATION_NAME" '^[a-z0-9_]+$'
+  valid PURPOSE "$PURPOSE" '^(migration|replication)$'
+  valid TGT_MANAGED "$TGT_MANAGED" '^(none|rds)$'
+  for e in SRC_HOST TGT_HOST REPL_HOST; do valid "$e" "${!e}" '^[A-Za-z0-9._:-]+$'; done
+  for e in SRC_USER TGT_USER REPL_USER SRC_DB TGT_DB; do valid "$e" "${!e}" '^[A-Za-z0-9_.$-]+$'; done
+  for e in SRC_PORT TGT_PORT REPL_PORT DOWNTIME_MINUTES MAX_LAG_SECONDS THROUGHPUT_MBPS MARGIN_PCT JOBS SAMPLE_SECONDS; do
+    valid "$e" "${!e}" '^[0-9]+$'
+  done
+  for e in $SCHEMAS; do valid SCHEMAS "$e" '^[A-Za-z0-9_]+$'; done
+  for e in $EXCLUDE_DATA_TABLES; do valid EXCLUDE_DATA_TABLES "$e" '^[A-Za-z0-9_.$-]+$'; done
+  [ -z "$DEADLINE" ] || valid DEADLINE "$DEADLINE" '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+  [ "$JOBS" -ge 1 ] || JOBS=1
+
+  STATE="${STATE_DIR:-$HERE/runs/$MIGRATION_NAME}"
+  mkdir -p "$STATE"
+  PUB="dbm_${MIGRATION_NAME}"
+
+  if [ -z "${CLIENT_MODE:-}" ] || [ "$CLIENT_MODE" = auto ]; then
+    if command -v docker >/dev/null 2>&1; then CLIENT_MODE=docker; else CLIENT_MODE=local; fi
+  fi
+}
+
+same_family() { # mariadb and mysql can exchange dumps (with care); others must match
+  [ "$SRC_ENGINE" = "$TGT_ENGINE" ] && return 0
+  case "$SRC_ENGINE/$TGT_ENGINE" in mariadb/mysql|mysql/mariadb) return 0;; esac
+  return 1
+}
+homogeneous() { [ "$SRC_ENGINE" = "$TGT_ENGINE" ]; }
+
+require_supported_pair() {
+  same_family || die "cross-engine migration ($SRC_ENGINE → $TGT_ENGINE) needs schema conversion, which this tool does not do. Use AWS DMS with DMS Schema Conversion (or AWS SCT)."
+}
+
+# ── running clients ─────────────────────────────────────────────────────────
+#
+# Every connection detail and every SQL statement reaches the client through
+# the ENVIRONMENT and is expanded inside the client's shell, never spliced into
+# a command line: no quoting bugs, no injection, and no password in `ps`.
+
+CLIENT_ENVS=(PGPASSWORD PGSSLMODE MYSQL_PWD MONGO_URI MONGO_JS MONGO_CFG_YAML
+             DBM_SQL DBM_H DBM_P DBM_U DBM_D DBM_TLS DBM_SRCDB
+             DBM_H2 DBM_P2 DBM_U2 DBM_D2 DBM_PW2 DBM_TLS2)
+
+engine_image() {
+  case "$1" in postgres) echo "$PG_IMAGE";; mariadb) echo "$MARIADB_IMAGE";; mysql) echo "$MYSQL_IMAGE";; mongodb) echo "$MONGO_IMAGE";; esac
+}
+
+# client <engine> <shell command>
+client() {
+  local engine="$1"; shift
+  if [ "$CLIENT_MODE" = local ]; then
+    sh -c "$*"
+  else
+    local -a envs=(); local v
+    for v in "${CLIENT_ENVS[@]}"; do envs+=(-e "$v"); done
+    # -i and never -t: a TTY would rewrite the binary dump stream.
+    docker run --rm -i --network "$DOCKER_NETWORK" --user "$(id -u):$(id -g)" \
+      "${envs[@]}" -e HOME=/tmp --entrypoint sh "$(engine_image "$engine")" -c "$*"
+  fi
+}
+
+# use <src|tgt> — point the client environment at one side.
+use() {
+  local p
+  case "$1" in src) p=SRC;; tgt) p=TGT;; *) die "internal: bad side '$1'";; esac
+  local v pw ssl
+  v="${p}_ENGINE"; C_ENGINE="${!v}"
+  v="${p}_HOST";   C_HOST="${!v}"
+  v="${p}_PORT";   C_PORT="${!v}"
+  v="${p}_USER";   C_USER="${!v}"
+  v="${p}_DB";     C_DB="${!v}"
+  v="${p}_SSL";    ssl="${!v:-prefer}"
+  v="${p}_PASSWORD"; pw="${!v:-}"
+  local uri_var="${p}_MONGO_URI"
+  if [ -z "$pw" ] && ! { [ "$C_ENGINE" = mongodb ] && [ -n "${!uri_var:-}" ]; }; then
+    die "${p}_PASSWORD is not set — export it in your shell (it is never read from the config file's directory or written anywhere)"
+  fi
+  export DBM_H="$C_HOST" DBM_P="$C_PORT" DBM_U="$C_USER" DBM_D="$C_DB" DBM_SRCDB="$SRC_DB"
+  DBM_TLS=""
+  case "$C_ENGINE" in
+    postgres)
+      case "$ssl" in verify) ssl=verify-full;; esac
+      export PGPASSWORD="$pw" PGSSLMODE="$ssl" ;;
+    mariadb)
+      export MYSQL_PWD="$pw"
+      case "$ssl" in require) DBM_TLS="--ssl --ssl-verify-server-cert=0";; verify) DBM_TLS="--ssl --ssl-verify-server-cert";; disable) DBM_TLS="--skip-ssl";; *) DBM_TLS="--ssl-verify-server-cert=0";; esac ;;
+    mysql)
+      export MYSQL_PWD="$pw"
+      case "$ssl" in require) DBM_TLS="--ssl-mode=REQUIRED";; verify) DBM_TLS="--ssl-mode=VERIFY_IDENTITY";; disable) DBM_TLS="--ssl-mode=DISABLED";; *) DBM_TLS="--ssl-mode=PREFERRED";; esac ;;
+    mongodb)
+      if [ -n "${!uri_var:-}" ]; then
+        MONGO_URI="${!uri_var}"
+      else
+        local adb_var="${p}_AUTH_DB"
+        MONGO_URI="mongodb://$(urlenc "$C_USER"):$(urlenc "$pw")@${C_HOST}:${C_PORT}/?authSource=${!adb_var:-admin}"
+        case "$ssl" in require|verify) MONGO_URI+="&tls=true";; esac
+        [ "$ssl" = require ] && MONGO_URI+="&tlsAllowInvalidCertificates=true"
+      fi
+      export MONGO_URI
+      MONGO_CFG_YAML="uri: '$(printf '%s' "$MONGO_URI" | sed "s/'/''/g")'"; export MONGO_CFG_YAML ;;
+  esac
+  export DBM_TLS
+}
+
+# mongo tools read the URI from a private temp file, never from argv.
+MCFG='umask 077; c=$(mktemp); trap "rm -f \"$c\"" EXIT; printf "%s\n" "$MONGO_CFG_YAML" > "$c";'
+
+# q <side> <sql> — rows on stdout, columns separated by '|'.
+# Set QDB= (empty) to connect a MariaDB/MySQL client without a default database.
+q() {
+  use "$1"; export DBM_SQL="$2"
+  [ -z "${QDB+x}" ] || export DBM_D="$QDB"
+  case "$C_ENGINE" in
+    postgres) client postgres 'psql -X -A -t -q -v ON_ERROR_STOP=1 -F "|" -h "$DBM_H" -p "$DBM_P" -U "$DBM_U" -d "$DBM_D" -c "$DBM_SQL"' ;;
+    mariadb)  client mariadb  'mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -N -B ${DBM_D:+"$DBM_D"} -e "$DBM_SQL"' | tr '\t' '|' ;;
+    mysql)    client mysql    'mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -N -B ${DBM_D:+"$DBM_D"} -e "$DBM_SQL"' | tr '\t' '|' ;;
+    *) die "internal: q() on $C_ENGINE" ;;
+  esac
+}
+
+# qv <side> <sql> — MariaDB/MySQL vertical output (SHOW ... STATUS)
+qv() {
+  use "$1"; export DBM_SQL="$2"
+  case "$C_ENGINE" in
+    mariadb) client mariadb 'mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -E -e "$DBM_SQL"' ;;
+    mysql)   client mysql   'mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" -E -e "$DBM_SQL"' ;;
+  esac
+}
+
+# js <side> <javascript> — run against the side's database as `db`.
+js() {
+  use "$1"
+  MONGO_JS="void (globalThis.db = connect(process.env.MONGO_URI).getSiblingDB(process.env.DBM_D));
+$2"
+  export MONGO_JS
+  client mongodb 'mongosh --nodb --quiet --eval "$MONGO_JS"'
+}
+
+pg_schema_list() { local s o=""; for s in $SCHEMAS; do o+="${o:+,}'$s'"; done; printf '%s' "$o"; }
+pg_excl_list()   { local s o=""; for s in $EXCLUDE_DATA_TABLES; do o+="${o:+,}'$s'"; done; printf '%s' "${o:-''}"; }
+is_excluded()    { local t; for t in $EXCLUDE_DATA_TABLES; do [ "$t" = "$1" ] && return 0; done; return 1; }
+
+ver_major() { # comparable version: "10.11.6-MariaDB" → 1011, "8.4.2" → 804; mongodb "7.0.12" → 7
+  if [ "${2:-}" = mongodb ]; then awk -F'[.-]' '{ print $1 + 0 }' <<<"$1"
+  else awk -F'[.-]' '{ printf "%d%02d\n", $1, $2 }' <<<"$1"; fi
+}
+
+record_run() { # record_run <phase> <step> <seconds> <bytes> <status>
+  printf '%s|%s|%s|%s|%s|%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" "$4" "$5" >> "$STATE/runs.log"
+}
+
+load_assessment() {
+  [ -f "$STATE/assessment.env" ] || die "no assessment yet — run: $PROG assess $CONF"
+  # shellcheck source=/dev/null
+  . "$STATE/assessment.env"
+}
+load_plan() {
+  [ -f "$STATE/plan.env" ] || die "no plan yet — run: $PROG plan $CONF"
+  # shellcheck source=/dev/null
+  . "$STATE/plan.env"
+  [ -z "${OPT_STRATEGY:-}" ] || STRATEGY="$OPT_STRATEGY"
+}
+
+confirm() { # confirm <what to type> <prompt>
+  [ "${OPT_YES:-0}" = 1 ] && return 0
+  [ -t 0 ] || die "this step needs confirmation; re-run in a terminal or pass --yes"
+  local a
+  printf '\n%s\nType %s to continue: ' "$2" "$1" >&2
+  read -r a
+  [ "$a" = "$1" ] || die "not confirmed — nothing was changed"
+}
+
+# ── 1. assess ───────────────────────────────────────────────────────────────
+
+BLOCKERS=(); WARNINGS=(); NOTES=(); CDC_ISSUES=()
+declare -A A=()
+
+assess_postgres() {
+  local sl row num ver enc coll dbsize
+  sl="$(pg_schema_list)"
+
+  log "source: version, encoding, size"
+  row="$(q src "SELECT current_setting('server_version_num'), current_setting('server_version'), pg_encoding_to_char(d.encoding), d.datcollate, pg_database_size(current_database()) FROM pg_database d WHERE d.datname = current_database()")" \
+    || die "cannot connect to the SOURCE ($SRC_HOST:$SRC_PORT/$SRC_DB) — check network reachability, credentials and SRC_SSL"
+  IFS='|' read -r num ver enc coll dbsize <<<"$row"
+  A[SRC_VERSION]="$ver"; A[SRC_MAJOR]=$(( num / 10000 )); A[SRC_ENCODING]="$enc"; A[SRC_COLLATION]="$coll"; A[DB_BYTES]="$dbsize"
+  ok "PostgreSQL $ver, $enc / $coll, database $(hb "$dbsize")"
+
+  log "source: tables, rows, size in schemas: $SCHEMAS"
+  row="$(q src "SELECT count(*), coalesce(sum(greatest(c.reltuples, (SELECT s.n_live_tup FROM pg_stat_all_tables s WHERE s.relid = c.oid), 0)), 0)::bigint, coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($sl)")"
+  IFS='|' read -r A[TABLES] A[ROWS] A[SIZE_BYTES] <<<"$row"
+  ok "${A[TABLES]} tables, ~${A[ROWS]} rows, $(hb "${A[SIZE_BYTES]}") incl. indexes"
+  [ "${A[TABLES]}" -gt 0 ] || BLOCKERS+=("No tables found in schemas '$SCHEMAS' of $SRC_DB — check SCHEMAS in the config.")
+
+  q src "SELECT format('%I.%I', n.nspname, c.relname), pg_total_relation_size(c.oid), greatest(c.reltuples, (SELECT s.n_live_tup FROM pg_stat_all_tables s WHERE s.relid = c.oid), 0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($sl) ORDER BY 2 DESC LIMIT 10" > "$STATE/top_tables.txt"
+
+  q src "SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($sl) AND (c.relreplident = 'n' OR (c.relreplident = 'd' AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'p'))) ORDER BY 1" > "$STATE/no_pk.txt"
+  A[NO_PK]="$(grep -c . "$STATE/no_pk.txt" || true)"
+
+  log "source: LOB columns (text, bytea, json, jsonb, xml)"
+  q src "SELECT format('%I.%I.%I', c.table_schema, c.table_name, c.column_name), c.data_type FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE' WHERE c.table_schema IN ($sl) AND c.data_type IN ('text', 'bytea', 'json', 'jsonb', 'xml') ORDER BY 1" > "$STATE/lob_columns.txt"
+  A[LOB_COLUMNS]="$(grep -c . "$STATE/lob_columns.txt" || true)"
+  if [ "${OPT_DEEP:-0}" = 1 ] && [ "${A[LOB_COLUMNS]}" -gt 0 ]; then
+    info "--deep: measuring the longest value of each LOB column (full scans)"
+    local sql
+    sql="$(q src "SELECT string_agg(format('SELECT %L, coalesce(max(octet_length(%I::text)), 0) FROM %I.%I', format('%I.%I.%I', c.table_schema, c.table_name, c.column_name), c.column_name, c.table_schema, c.table_name), ' UNION ALL ') FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE' WHERE c.table_schema IN ($sl) AND c.data_type IN ('text', 'json', 'jsonb', 'xml')")"
+    [ -z "$sql" ] || q src "$sql" > "$STATE/lob_max.txt"
+    q src "SELECT string_agg(format('SELECT %L, coalesce(max(octet_length(%I)), 0) FROM %I.%I', format('%I.%I.%I', c.table_schema, c.table_name, c.column_name), c.column_name, c.table_schema, c.table_name), ' UNION ALL ') FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE' WHERE c.table_schema IN ($sl) AND c.data_type = 'bytea'" > "$STATE/.bytea.sql"
+    [ ! -s "$STATE/.bytea.sql" ] || q src "$(cat "$STATE/.bytea.sql")" >> "$STATE/lob_max.txt"
+    rm -f "$STATE/.bytea.sql"
+    A[LOB_MAX_BYTES]="$(awk -F'|' 'BEGIN{m=0} $2>m{m=$2} END{print m}' "$STATE/lob_max.txt")"
+  fi
+
+  row="$(q src "SELECT count(*) FROM pg_largeobject_metadata")"; A[LARGE_OBJECTS]="$row"
+
+  log "source: other objects, extensions, roles"
+  row="$(q src "SELECT (SELECT count(*) FROM pg_views WHERE schemaname IN ($sl)), (SELECT count(*) FROM pg_matviews WHERE schemaname IN ($sl)), (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname IN ($sl)), (SELECT count(*) FROM pg_sequences WHERE schemaname IN ($sl)), (SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT t.tgisinternal AND n.nspname IN ($sl)), (SELECT coalesce(string_agg(extname, ' ' ORDER BY extname), '') FROM pg_extension WHERE extname <> 'plpgsql')")"
+  IFS='|' read -r A[VIEWS] A[MATVIEWS] A[FUNCTIONS] A[SEQUENCES] A[TRIGGERS] A[EXTENSIONS] <<<"$row"
+  A[ROLES]="$(q src "SELECT coalesce(string_agg(DISTINCT r, ', '), '') FROM (SELECT grantee::text r FROM information_schema.role_table_grants WHERE table_schema IN ($sl) AND grantee NOT IN ('PUBLIC') UNION SELECT pg_get_userbyid(c.relowner)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname IN ($sl)) x")"
+
+  log "source: CDC readiness (logical replication)"
+  local wal slots senders used repl recov
+  row="$(q src "SELECT current_setting('wal_level'), current_setting('max_replication_slots'), current_setting('max_wal_senders'), (SELECT count(*) FROM pg_replication_slots), coalesce((SELECT rolsuper OR rolreplication FROM pg_roles WHERE rolname = current_user), false) OR coalesce(pg_has_role(current_user, (SELECT oid FROM pg_roles WHERE rolname = 'rds_replication'), 'member'), false), pg_is_in_recovery()")"
+  IFS='|' read -r wal slots senders used repl recov <<<"$row"
+  A[WAL_LEVEL]="$wal"
+  [ "$wal" = logical ] || CDC_ISSUES+=("wal_level is '$wal'; CDC needs 'logical' (RDS/Aurora: set rds.logical_replication=1 in the parameter group and reboot).")
+  [ "$repl" = t ] || CDC_ISSUES+=("$SRC_USER (or REPL_USER) needs REPLICATION (RDS: GRANT rds_replication TO $REPL_USER).")
+  [ "$used" -lt "$slots" ] || CDC_ISSUES+=("All $slots replication slots are in use (max_replication_slots).")
+  [ "$recov" = f ] || CDC_ISSUES+=("The source is a standby; logical replication from a standby needs PostgreSQL 16+ and hot_standby_feedback.")
+  [ "${A[NO_PK]}" -eq 0 ] || CDC_ISSUES+=("${A[NO_PK]} table(s) have no primary key / replica identity (see no_pk.txt). Once published, UPDATE and DELETE on them FAIL ON THE SOURCE. Fix first: ALTER TABLE … REPLICA IDENTITY FULL (or add a primary key).")
+  [ "${A[LARGE_OBJECTS]}" -eq 0 ] || CDC_ISSUES+=("${A[LARGE_OBJECTS]} large objects (pg_largeobject) exist; logical replication does not carry them — they are copied only by a full load.")
+  NOTES+=("Logical replication does not carry DDL: freeze schema changes on the source from the start of CDC until cutover.")
+  [ "${A[SEQUENCES]}" -eq 0 ] || NOTES+=("${A[SEQUENCES]} sequences: logical replication does not advance them; \`cutover\` copies their values before the switch.")
+
+  if [ "$recov" = f ] && [ "$SAMPLE_SECONDS" -gt 0 ]; then
+    log "source: measuring WAL generation for ${SAMPLE_SECONDS}s (set SAMPLE_SECONDS=0 or --sample 0 to skip)"
+    local l1 l2 d
+    l1="$(q src "SELECT pg_current_wal_lsn()")"; sleep "$SAMPLE_SECONDS"; l2="$(q src "SELECT pg_current_wal_lsn()")"
+    d="$(q src "SELECT pg_wal_lsn_diff('$l2', '$l1')::bigint")"
+    A[LOG_BYTES_PER_HOUR]=$(( d * 3600 / SAMPLE_SECONDS ))
+    ok "WAL: $(hb "$d") in ${SAMPLE_SECONDS}s ≈ $(hb "${A[LOG_BYTES_PER_HOUR]}")/hour (whole cluster, this moment only)"
+  fi
+
+  log "target: connectivity, version, encoding, emptiness"
+  if row="$(q tgt "SELECT current_setting('server_version_num'), current_setting('server_version'), pg_encoding_to_char(d.encoding), d.datcollate FROM pg_database d WHERE d.datname = current_database()")"; then
+    local tnum tver tenc tcoll
+    IFS='|' read -r tnum tver tenc tcoll <<<"$row"
+    A[TGT_VERSION]="$tver"; A[TGT_MAJOR]=$(( tnum / 10000 )); A[TGT_ENCODING]="$tenc"; A[TGT_COLLATION]="$tcoll"
+    ok "PostgreSQL $tver, $tenc / $tcoll"
+    A[TGT_OBJECTS]="$(q tgt "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname IN ($sl)")"
+    local ext missing=""
+    for ext in ${A[EXTENSIONS]}; do
+      [ -n "$(q tgt "SELECT 1 FROM pg_available_extensions WHERE name = '$ext'")" ] || missing+=" $ext"
+    done
+    [ -z "$missing" ] || BLOCKERS+=("Extensions used on the source are not available on the target:$missing")
+    [ "${A[TGT_MAJOR]}" -ge "${A[SRC_MAJOR]}" ] || BLOCKERS+=("Target is PostgreSQL ${A[TGT_MAJOR]}, older than the source (${A[SRC_MAJOR]}). Moving to an older major is not supported.")
+    [ "$tcoll" = "$coll" ] || WARNINGS+=("Collation differs (source $coll, target $tcoll): text sort order and unique indexes on text may behave differently. Verify in the test migration.")
+  else
+    BLOCKERS+=("Cannot connect to the TARGET ($TGT_HOST:$TGT_PORT/$TGT_DB). Check the network path (VPN / Direct Connect / security groups), credentials and TGT_SSL.")
+  fi
+}
+
+assess_mysqlish() {
+  local row
+  log "source: version, character set, binlog"
+  row="$(q src "SELECT VERSION(), @@character_set_database, @@collation_database, @@log_bin, @@binlog_format, @@server_id")" \
+    || die "cannot connect to the SOURCE ($SRC_HOST:$SRC_PORT/$SRC_DB) — check network reachability, credentials and SRC_SSL"
+  local ver cs coll logbin fmt sid
+  IFS='|' read -r ver cs coll logbin fmt sid <<<"$row"
+  A[SRC_VERSION]="$ver"; A[SRC_MAJOR]="$(ver_major "$ver")"; A[SRC_ENCODING]="$cs"; A[SRC_COLLATION]="$coll"; A[SRC_SERVER_ID]="$sid"
+  ok "$ver, $cs / $coll, binlog=$logbin format=$fmt"
+
+  log "source: tables, rows, size"
+  row="$(q src "SELECT count(*), coalesce(sum(table_rows), 0), coalesce(sum(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'")"
+  IFS='|' read -r A[TABLES] A[ROWS] A[SIZE_BYTES] <<<"$row"
+  A[DB_BYTES]="${A[SIZE_BYTES]}"
+  ok "${A[TABLES]} tables, ~${A[ROWS]} rows, $(hb "${A[SIZE_BYTES]}") incl. indexes"
+  [ "${A[TABLES]}" -gt 0 ] || BLOCKERS+=("No tables found in $SRC_DB.")
+
+  q src "SELECT table_name, data_length + index_length, table_rows FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY 2 DESC LIMIT 10" > "$STATE/top_tables.txt"
+  q src "SELECT t.table_name FROM information_schema.tables t WHERE t.table_schema = DATABASE() AND t.table_type = 'BASE TABLE' AND NOT EXISTS (SELECT 1 FROM information_schema.table_constraints c WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name AND c.constraint_type = 'PRIMARY KEY') ORDER BY 1" > "$STATE/no_pk.txt"
+  A[NO_PK]="$(grep -c . "$STATE/no_pk.txt" || true)"
+  [ "${A[NO_PK]}" -eq 0 ] || WARNINGS+=("${A[NO_PK]} table(s) without a primary key (no_pk.txt): row-based replication applies each change to them with a full table scan, so CDC lag can grow badly. Validation cannot match rows on them by key either.")
+
+  local nonInno
+  nonInno="$(q src "SELECT GROUP_CONCAT(CONCAT(table_name, ' (', engine, ')') SEPARATOR ', ') FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' AND engine <> 'InnoDB'")"
+  [ "$nonInno" = NULL ] || [ -z "$nonInno" ] || WARNINGS+=("Non-InnoDB tables: $nonInno. --single-transaction is not consistent for them; stop writes to them during the full load.")
+
+  log "source: LOB columns (TEXT, BLOB, JSON)"
+  q src "SELECT CONCAT(c.table_name, '.', c.column_name), c.data_type FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE' WHERE c.table_schema = DATABASE() AND c.data_type IN ('tinytext','text','mediumtext','longtext','tinyblob','blob','mediumblob','longblob','json') ORDER BY 1" > "$STATE/lob_columns.txt"
+  A[LOB_COLUMNS]="$(grep -c . "$STATE/lob_columns.txt" || true)"
+  if [ "${OPT_DEEP:-0}" = 1 ] && [ "${A[LOB_COLUMNS]}" -gt 0 ]; then
+    info "--deep: measuring the longest value of each LOB column (full scans)"
+    local sql
+    sql="$(q src 'SET SESSION group_concat_max_len = 16777216; SELECT GROUP_CONCAT(CONCAT("SELECT ", QUOTE(CONCAT(c.table_name, ".", c.column_name)), ", COALESCE(MAX(LENGTH(`", REPLACE(c.column_name, "`", "``"), "`)), 0) FROM `", REPLACE(c.table_name, "`", "``"), "`") SEPARATOR " UNION ALL ") FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = "BASE TABLE" WHERE c.table_schema = DATABASE() AND c.data_type IN ("tinytext","text","mediumtext","longtext","tinyblob","blob","mediumblob","longblob","json")')"
+    q src "$sql" > "$STATE/lob_max.txt"
+    A[LOB_MAX_BYTES]="$(awk -F'|' 'BEGIN{m=0} $2>m{m=$2} END{print m}' "$STATE/lob_max.txt")"
+  fi
+
+  local nonutf
+  nonutf="$(q src "SELECT count(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND character_set_name IS NOT NULL AND character_set_name NOT LIKE 'utf8%'")"
+  [ "$nonutf" -eq 0 ] || WARNINGS+=("$nonutf column(s) use a non-Unicode character set. Garbled characters are possible — verify sample rows in the test migration.")
+
+  log "source: other objects, definers"
+  row="$(q src "SELECT (SELECT count(*) FROM information_schema.views WHERE table_schema = DATABASE()), (SELECT count(*) FROM information_schema.routines WHERE routine_schema = DATABASE()), (SELECT count(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE()), (SELECT count(*) FROM information_schema.events WHERE event_schema = DATABASE())")"
+  IFS='|' read -r A[VIEWS] A[FUNCTIONS] A[TRIGGERS] A[EVENTS] <<<"$row"
+  A[ROLES]="$(q src "SELECT COALESCE(GROUP_CONCAT(DISTINCT d SEPARATOR ', '), '') FROM (SELECT definer d FROM information_schema.views WHERE table_schema = DATABASE() UNION SELECT definer FROM information_schema.routines WHERE routine_schema = DATABASE() UNION SELECT definer FROM information_schema.triggers WHERE trigger_schema = DATABASE() UNION SELECT definer FROM information_schema.events WHERE event_schema = DATABASE()) x")"
+  if [ -n "${A[ROLES]}" ] && [ "$STRIP_DEFINERS" = true ]; then
+    NOTES+=("Definers (${A[ROLES]}) are stripped on load (STRIP_DEFINERS=true): views/routines/triggers will be owned by $TGT_USER on the target.")
+  fi
+
+  log "source: CDC readiness (binlog replication)"
+  [ "$logbin" = 1 ] || CDC_ISSUES+=("Binary logging is off (log_bin=0). Turn it on (RDS: set backup retention > 0).")
+  [ "$fmt" = ROW ] || CDC_ISSUES+=("binlog_format is $fmt; set it to ROW.")
+  local grants
+  grants="$(q src "SHOW GRANTS" 2>/dev/null || true)"
+  grep -Eq 'ALL PRIVILEGES ON \*\.\*|REPLICATION (SLAVE|REPLICA)' <<<"$grants" || CDC_ISSUES+=("$REPL_USER needs REPLICATION SLAVE (MySQL: REPLICATION SLAVE; MariaDB 10.5+: REPLICATION REPLICA).")
+  grep -Eq 'ALL PRIVILEGES ON \*\.\*|RELOAD' <<<"$grants" || CDC_ISSUES+=("$SRC_USER needs RELOAD to record the binlog position during the dump (FLUSH TABLES WITH READ LOCK, held for a moment).")
+  [ "$SRC_DB" = "$TGT_DB" ] || CDC_ISSUES+=("CDC replicates by database name; SRC_DB and TGT_DB must be the same.")
+  NOTES+=("The binlog must be retained from the start of the full load until CDC catches up (RDS: CALL mysql.rds_set_configuration('binlog retention hours', 48)).")
+
+  if [ "$logbin" = 1 ] && [ "$SAMPLE_SECONDS" -gt 0 ]; then
+    log "source: measuring binlog generation for ${SAMPLE_SECONDS}s"
+    local b1 b2
+    if b1="$(q src "SHOW BINARY LOGS" 2>/dev/null | awk -F'|' '{s+=$2} END{print s+0}')" && [ "$b1" -gt 0 ]; then
+      sleep "$SAMPLE_SECONDS"
+      b2="$(q src "SHOW BINARY LOGS" | awk -F'|' '{s+=$2} END{print s+0}')"
+      if [ "$b2" -ge "$b1" ]; then
+        A[LOG_BYTES_PER_HOUR]=$(( (b2 - b1) * 3600 / SAMPLE_SECONDS ))
+        ok "binlog ≈ $(hb "${A[LOG_BYTES_PER_HOUR]}")/hour (whole server, this moment only)"
+      else
+        warn "binlogs were purged during the sample — rate not measured"
+      fi
+    else
+      warn "SHOW BINARY LOGS not permitted — binlog rate not measured"
+    fi
+  fi
+
+  log "target: connectivity, version, character set, emptiness"
+  if row="$(QDB='' q tgt "SELECT VERSION(), @@character_set_server, @@server_id")"; then
+    local tver tcs tsid
+    IFS='|' read -r tver tcs tsid <<<"$row"
+    A[TGT_VERSION]="$tver"; A[TGT_MAJOR]="$(ver_major "$tver")"; A[TGT_ENCODING]="$tcs"; A[TGT_SERVER_ID]="$tsid"
+    ok "$tver, server charset $tcs"
+    A[TGT_OBJECTS]="$(QDB='' q tgt "SELECT count(*) FROM information_schema.tables WHERE table_schema = '$TGT_DB'")"
+    [ "$tsid" != "$sid" ] || CDC_ISSUES+=("Source and target have the same server_id ($sid); replication needs them different.")
+    if homogeneous && [ "${A[TGT_MAJOR]}" -lt "${A[SRC_MAJOR]}" ]; then
+      WARNINGS+=("Target ($tver) is older than the source ($ver). Features used on the source may not exist on the target.")
+    fi
+  else
+    BLOCKERS+=("Cannot connect to the TARGET ($TGT_HOST:$TGT_PORT). Check the network path (VPN / Direct Connect / security groups), credentials and TGT_SSL.")
+  fi
+  if ! homogeneous; then
+    WARNINGS+=("$SRC_ENGINE → $TGT_ENGINE: the two have diverged (sequences, JSON storage, system-versioned tables, collations such as utf8mb4_0900_ai_ci). Expect DDL edits; full load only — CDC between them is not supported here.")
+    CDC_ISSUES+=("CDC between MariaDB and MySQL is not supported by this tool.")
+  fi
+}
+
+assess_mongodb() {
+  local out
+  log "source: version, size, collections, oplog"
+  out="$(js src '
+    const s = db.stats();
+    print("SRC_VERSION=" + db.version());
+    print("SIZE_BYTES=" + (Number(s.dataSize) + Number(s.indexSize)));
+    print("DB_BYTES=" + Number(s.storageSize));
+    print("ROWS=" + Number(s.objects));
+    print("INDEXES=" + Number(s.indexes));
+    const infos = db.getCollectionInfos();
+    const colls = infos.filter(c => c.type === "collection" && !c.name.startsWith("system."));
+    print("TABLES=" + colls.length);
+    print("VIEWS=" + infos.filter(c => c.type === "view").length);
+    print("TIMESERIES=" + infos.filter(c => c.type === "timeseries").length);
+    print("CAPPED=" + colls.filter(c => c.options && c.options.capped).length);
+    print("VALIDATORS=" + colls.filter(c => c.options && c.options.validator).length);
+    const sizes = colls.map(c => { let st = {}; try { st = db.getCollection(c.name).stats(); } catch (e) {}
+      return [c.name, Number(st.size || 0) + Number(st.totalIndexSize || 0), Number(st.count || 0)]; });
+    sizes.sort((a, b) => b[1] - a[1]).slice(0, 10).forEach(x => print("TOP=" + x.join("|")));
+    const h = db.hello();
+    print("REPLSET=" + (h.setName || ""));
+    try { const r = db.getReplicationInfo();
+      if (r && r.timeDiff > 0) {
+        print("OPLOG_WINDOW_HOURS=" + Math.floor(r.timeDiff / 3600));
+        print("LOG_BYTES_PER_HOUR=" + Math.floor(r.usedMB * 1048576 / (r.timeDiff / 3600)));
+      } } catch (e) {}
+  ')" || die "cannot connect to the SOURCE ($SRC_HOST:$SRC_PORT/$SRC_DB) — check network, credentials, SRC_AUTH_DB and SRC_SSL"
+  local line k
+  while IFS= read -r line; do
+    case "$line" in
+      TOP=*) printf '%s\n' "${line#TOP=}" >> "$STATE/top_tables.txt" ;;
+      *=*)   k="${line%%=*}"; A[$k]="${line#*=}" ;;
+    esac
+  done <<<"$out"
+  A[SRC_MAJOR]="$(ver_major "${A[SRC_VERSION]}" mongodb)"; A[SRC_ENCODING]="UTF-8 (BSON)"
+  A[NO_PK]=0; A[LOB_COLUMNS]=0
+  ok "MongoDB ${A[SRC_VERSION]}, ${A[TABLES]} collections, ${A[ROWS]} documents, $(hb "${A[SIZE_BYTES]}")"
+  [ -n "${A[REPLSET]:-}" ] || NOTES+=("Source is not a replica set: there is no oplog, so no CDC of any kind is possible — full load in a write freeze only.")
+  [ -z "${A[OPLOG_WINDOW_HOURS]:-}" ] || NOTES+=("Oplog window ≈ ${A[OPLOG_WINDOW_HOURS]}h.")
+  CDC_ISSUES+=("This tool has no native MongoDB CDC. For short downtime use mongosync (MongoDB 6.0+ on both sides) or AWS DMS Homogeneous Data Migrations (DocumentDB / MongoDB targets).")
+  NOTES+=("Users and roles are not copied (mongodump --db does not include them): create them on the target.")
+
+  log "target: connectivity, version, emptiness"
+  if out="$(js tgt 'print(db.version() + "|" + db.getCollectionNames().filter(n => !n.startsWith("system.")).length)')"; then
+    IFS='|' read -r A[TGT_VERSION] A[TGT_OBJECTS] <<<"$out"
+    A[TGT_MAJOR]="$(ver_major "${A[TGT_VERSION]}" mongodb)"; A[TGT_ENCODING]="UTF-8 (BSON)"
+    ok "MongoDB ${A[TGT_VERSION]}"
+    [ "${A[TGT_MAJOR]}" -ge "${A[SRC_MAJOR]}" ] || WARNINGS+=("Target ${A[TGT_VERSION]} is older than the source ${A[SRC_VERSION]}; check featureCompatibilityVersion and operators used.")
+  else
+    BLOCKERS+=("Cannot connect to the TARGET ($TGT_HOST:$TGT_PORT). Check the network path, credentials, TGT_AUTH_DB and TGT_SSL.")
+  fi
+}
+
+cmd_assess() {
+  rm -f "$STATE/top_tables.txt" "$STATE/no_pk.txt" "$STATE/lob_columns.txt" "$STATE/lob_max.txt"
+  log "Assessing '$MIGRATION_NAME': $SRC_ENGINE $SRC_HOST/$SRC_DB → $TGT_ENGINE $TGT_HOST/$TGT_DB  (client: $CLIENT_MODE)"
+  if ! same_family; then
+    BLOCKERS+=("Cross-engine migration ($SRC_ENGINE → $TGT_ENGINE). Schemas, types and code must be converted: use AWS DMS with DMS Schema Conversion (or AWS SCT). This tool still assesses the source below.")
+  fi
+  case "$SRC_ENGINE" in
+    postgres) assess_postgres ;;
+    mariadb|mysql) assess_mysqlish ;;
+    mongodb) assess_mongodb ;;
+  esac
+  touch "$STATE/top_tables.txt" "$STATE/no_pk.txt" "$STATE/lob_columns.txt"
+
+  # Character encoding (requirement: garbled text with non-Unicode sources)
+  case "${A[SRC_ENCODING]:-}" in
+    UTF8|utf8*|UTF-8*) ;;
+    *) WARNINGS+=("Source encoding ${A[SRC_ENCODING]:-unknown} is not Unicode. Include a check of non-ASCII sample rows in the test migration.") ;;
+  esac
+  if [ -n "${A[TGT_ENCODING]:-}" ] && [ "${A[TGT_ENCODING]}" != "${A[SRC_ENCODING]}" ] && [ "$SRC_ENGINE" = postgres ]; then
+    WARNINGS+=("Encoding differs: source ${A[SRC_ENCODING]}, target ${A[TGT_ENCODING]}. Characters with no equivalent will fail to load.")
+  fi
+  if [ "${A[TGT_OBJECTS]:-0}" -gt 0 ]; then
+    WARNINGS+=("The target already has ${A[TGT_OBJECTS]} object(s) in the migrated schema/database. full-load refuses a non-empty target — use an empty one.")
+  fi
+  NOTES+=("Users, roles and grants are never migrated by this tool; create them on the target (source grantees/owners: ${A[ROLES]:-n/a}).")
+
+  A[CDC_READY]=yes; [ "${#CDC_ISSUES[@]}" -eq 0 ] || A[CDC_READY]=no
+  A[ASSESSED_AT]="$(date -u +%FT%TZ)"
+
+  { local k; for k in "${!A[@]}"; do printf '%s=%q\n' "$k" "${A[$k]}"; done; } > "$STATE/assessment.env"
+  printf '%s\n' "${BLOCKERS[@]+"${BLOCKERS[@]}"}"   > "$STATE/blockers.txt"
+  printf '%s\n' "${WARNINGS[@]+"${WARNINGS[@]}"}"   > "$STATE/warnings.txt"
+  printf '%s\n' "${NOTES[@]+"${NOTES[@]}"}"         > "$STATE/notes.txt"
+  printf '%s\n' "${CDC_ISSUES[@]+"${CDC_ISSUES[@]}"}" > "$STATE/cdc_issues.txt"
+  write_assessment_md
+  echo
+  ok "assessment written: $STATE/assessment.md"
+  [ "${#BLOCKERS[@]}" -eq 0 ] || { warn "${#BLOCKERS[@]} blocker(s):"; printf '     - %s\n' "${BLOCKERS[@]}" >&2; }
+  [ "${#WARNINGS[@]}" -eq 0 ] || { warn "${#WARNINGS[@]} warning(s):"; printf '     - %s\n' "${WARNINGS[@]}" >&2; }
+  info "next: $PROG plan $CONF"
+}
+
+bullets() { # bullets <file> — markdown list, or "none"
+  if [ -s "$1" ] && grep -q . "$1"; then sed '/^$/d; s/^/- /' "$1"; else echo "- none"; fi
+}
+
+write_assessment_md() {
+  local f="$STATE/assessment.md"
+  {
+    echo "# Migration assessment — $MIGRATION_NAME"
+    echo
+    echo "Assessed ${A[ASSESSED_AT]} with \`$PROG assess\`. Raw values: \`assessment.env\`."
+    echo
+    echo "## 1. Purpose"
+    echo
+    if [ "$PURPOSE" = replication ]; then
+      echo "**Medium/long-term continuous replication** — the target is kept in sync alongside the source."
+    else
+      echo "**Database migration** — move from the source environment to the target, then switch applications over."
+    fi
+    echo
+    echo "## 2. Targets"
+    echo
+    echo "| | Source | Target |"
+    echo "|---|---|---|"
+    echo "| Engine | $SRC_ENGINE | $TGT_ENGINE |"
+    echo "| Endpoint | \`$SRC_HOST:$SRC_PORT/$SRC_DB\` | \`$TGT_HOST:$TGT_PORT/$TGT_DB\` |"
+    echo "| Version | ${A[SRC_VERSION]:-?} | ${A[TGT_VERSION]:-not reachable} |"
+    echo "| Encoding / collation | ${A[SRC_ENCODING]:-?} ${A[SRC_COLLATION]:+/ ${A[SRC_COLLATION]}} | ${A[TGT_ENCODING]:-?} ${A[TGT_COLLATION]:+/ ${A[TGT_COLLATION]}} |"
+    echo
+    echo "Migration type: **$(homogeneous && echo "homogeneous (same engine) — native tools" || { same_family && echo "same family ($SRC_ENGINE → $TGT_ENGINE) — native tools, full load only" || echo "heterogeneous — needs AWS DMS + Schema Conversion"; })**."
+    echo
+    echo "| Objects | Count | Migrated by |"
+    echo "|---|---|---|"
+    echo "| Tables / collections | ${A[TABLES]:-?} | dump + restore (and CDC) |"
+    echo "| Views | ${A[VIEWS]:-0} | dump + restore |"
+    [ -z "${A[MATVIEWS]:-}" ] || echo "| Materialized views | ${A[MATVIEWS]} | dump + restore (refreshed on load) |"
+    [ -z "${A[FUNCTIONS]:-}" ] || echo "| Functions / procedures | ${A[FUNCTIONS]} | dump + restore |"
+    [ -z "${A[SEQUENCES]:-}" ] || echo "| Sequences | ${A[SEQUENCES]} | dump; values re-synced at cutover |"
+    [ -z "${A[TRIGGERS]:-}" ] || echo "| Triggers | ${A[TRIGGERS]} | dump + restore |"
+    [ -z "${A[EVENTS]:-}" ] || echo "| Events | ${A[EVENTS]} | dump + restore |"
+    [ -z "${A[INDEXES]:-}" ] || echo "| Indexes | ${A[INDEXES]} | dump + restore |"
+    [ -z "${A[EXTENSIONS]:-}" ] || echo "| Extensions | ${A[EXTENSIONS]} | created on load (must be available on the target) |"
+    echo "| Users / roles / grants | — | **manual** (${A[ROLES]:-n/a}) |"
+    echo
+    echo "### CDC readiness: **${A[CDC_READY]}**"
+    echo
+    bullets "$STATE/cdc_issues.txt"
+    echo
+    echo "## 3. Scale"
+    echo
+    echo "| Metric | Value |"
+    echo "|---|---|"
+    echo "| Data to migrate (incl. indexes) | $(hb "${A[SIZE_BYTES]:-0}") |"
+    echo "| Whole database on disk | $(hb "${A[DB_BYTES]:-0}") |"
+    echo "| Tables / collections | ${A[TABLES]:-?} |"
+    echo "| Rows / documents (estimate) | ${A[ROWS]:-?} |"
+    echo "| LOB columns | ${A[LOB_COLUMNS]:-0}${A[LOB_MAX_BYTES]:+ (longest value $(hb "${A[LOB_MAX_BYTES]}"))} |"
+    echo "| Tables without a primary key | ${A[NO_PK]:-0} |"
+    if [ -n "${A[LOG_BYTES_PER_HOUR]:-}" ]; then
+      echo "| Transaction log generation | $(hb "${A[LOG_BYTES_PER_HOUR]}")/hour (${A[OPLOG_WINDOW_HOURS]:+oplog average}${A[OPLOG_WINDOW_HOURS]:-sampled for ${SAMPLE_SECONDS}s} — measure again at peak) |"
+    else
+      echo "| Transaction log generation | not measured |"
+    fi
+    echo
+    echo "Largest tables:"
+    echo
+    echo "| Table | Size | Rows |"
+    echo "|---|---|---|"
+    local n s r
+    while IFS='|' read -r n s r; do [ -n "$n" ] && echo "| \`$n\` | $(hb "$s") | $r |"; done < "$STATE/top_tables.txt"
+    echo
+    [ "${A[LOB_COLUMNS]:-0}" -eq 0 ] || { echo "LOB columns: see \`lob_columns.txt\`${A[LOB_MAX_BYTES]:+ and \`lob_max.txt\`}."; echo; }
+    [ "${A[NO_PK]:-0}" -eq 0 ] || { echo "Tables without a primary key: see \`no_pk.txt\`."; echo; }
+    [ -z "$EXCLUDE_DATA_TABLES" ] || { echo "Data **not** migrated (EXCLUDE_DATA_TABLES): \`$EXCLUDE_DATA_TABLES\`"; echo; }
+    echo "## 4–6. Downtime, latency, deadline"
+    echo
+    echo "| Requirement | Value |"
+    echo "|---|---|"
+    echo "| Acceptable downtime at cutover | $DOWNTIME_MINUTES min |"
+    echo "| Acceptable replication lag | $MAX_LAG_SECONDS s |"
+    echo "| Deadline | ${DEADLINE:-not set} |"
+    echo
+    echo "These are evaluated against the measurements in \`plan.md\`."
+    echo
+    echo "## Blockers"
+    echo; bullets "$STATE/blockers.txt"; echo
+    echo "## Warnings"
+    echo; bullets "$STATE/warnings.txt"; echo
+    echo "## Notes"
+    echo; bullets "$STATE/notes.txt"
+  } > "$f"
+}
+
+# ── 2. plan ─────────────────────────────────────────────────────────────────
+
+measured_throughput() { # bytes/sec from the latest successful timed load, or empty
+  [ -f "$STATE/runs.log" ] || return 0
+  awk -F'|' '($3 == "full-load" || $3 == "initial-sync") && $6 == "ok" && $4 > 0 && $5 > 0 { r = int($5 / $4); p = $2 } END { if (r) print r "|" p }' "$STATE/runs.log"
+}
+
+cmd_plan() {
+  load_assessment
+  local size="${SIZE_BYTES:-0}" thr_bps thr_src m
+  m="$(measured_throughput)"
+  if [ -n "$m" ]; then
+    thr_bps="${m%%|*}"; thr_src="measured in the last '${m##*|}' run"
+  else
+    thr_bps=$(( THROUGHPUT_MBPS * 1048576 )); thr_src="assumed THROUGHPUT_MBPS=$THROUGHPUT_MBPS (no test run yet)"
+  fi
+  [ "$thr_bps" -gt 0 ] || thr_bps=1
+  local fl_min fl_margin_min cut_full_min
+  fl_min="$(ceil_div "$size" $(( thr_bps * 60 )))"; [ "$fl_min" -ge 1 ] || fl_min=1
+  fl_margin_min=$(( fl_min * (100 + MARGIN_PCT) / 100 ))
+  cut_full_min=$(( fl_margin_min + VALIDATE_MINUTES + SWITCH_MINUTES ))
+
+  local strategy reason
+  local -a pblock=() pwarn=()
+  while IFS= read -r m; do [ -z "$m" ] || pblock+=("$m"); done < "$STATE/blockers.txt"
+
+  if [ "$PURPOSE" = replication ]; then
+    strategy="full-load+cdc"; reason="the purpose is continuous replication"
+  elif [ "$cut_full_min" -le "$DOWNTIME_MINUTES" ]; then
+    strategy="full-load"; reason="a full load with ${MARGIN_PCT}% margin plus validation and switch (~${cut_full_min} min) fits in the ${DOWNTIME_MINUTES}-minute window"
+  else
+    strategy="full-load+cdc"; reason="a full load alone (~${cut_full_min} min with margin) does not fit the ${DOWNTIME_MINUTES}-minute window: load in advance, keep in sync with CDC, cut over in minutes"
+  fi
+  [ -z "${OPT_STRATEGY:-}" ] || { strategy="$OPT_STRATEGY"; reason="forced with --strategy"; }
+
+  if [ "$strategy" = "full-load+cdc" ] && [ "${CDC_READY:-no}" != yes ]; then
+    pblock+=("The plan needs CDC but the source is not ready for it — fix the CDC issues listed below (or accept a longer downtime window).")
+  fi
+
+  # Log retention needed while the initial copy runs and CDC catches up.
+  local retain=""
+  if [ "$strategy" = "full-load+cdc" ] && [ -n "${LOG_BYTES_PER_HOUR:-}" ]; then
+    retain=$(( LOG_BYTES_PER_HOUR * (fl_margin_min / 60 + 1 + 24) ))
+  fi
+  if [ "$strategy" = "full-load+cdc" ] && [ -z "${LOG_BYTES_PER_HOUR:-}" ]; then
+    pwarn+=("Transaction log generation was not measured; size the source's free disk for retained WAL/binlog from monitoring (e.g. CloudWatch TransactionLogsGeneration) at peak.")
+  fi
+
+  # Schedule, working back from the deadline with a week of buffer.
+  local today d_test d_tune d_reh d_cut sched_ok=yes
+  today="$(date +%F)"
+  if [ -n "$DEADLINE" ]; then
+    d_cut="$(date_add "$DEADLINE" -7)"; d_reh="$(date_add "$d_cut" -7)"
+    d_tune="$(date_add "$d_reh" -5)";   d_test="$(date_add "$d_tune" -5)"
+    if [ "$(date_days_between "$today" "$d_test")" -lt 0 ]; then
+      sched_ok=no
+      pwarn+=("The deadline $DEADLINE leaves less than the recommended ~24 days for test → tuning → rehearsal → cutover with a week of buffer. Compress the phases knowingly, or move the deadline.")
+    fi
+  else
+    d_test="$(date_add "$today" 3)"; d_tune="$(date_add "$d_test" 5)"; d_reh="$(date_add "$d_tune" 5)"; d_cut="$(date_add "$d_reh" 7)"
+    pwarn+=("No DEADLINE set: the dates below are only a suggested pace from today.")
+  fi
+
+  cat > "$STATE/plan.env" <<EOF
+STRATEGY=$strategy
+FULL_LOAD_MINUTES=$fl_min
+THROUGHPUT_BPS=$thr_bps
+PLANNED_AT=$(date -u +%FT%TZ)
+EOF
+
+  local f="$STATE/plan.md" b
+  {
+    echo "# Migration plan — $MIGRATION_NAME"
+    echo
+    echo "Generated $(date -u +%FT%TZ) by \`$PROG plan\` from \`assessment.md\`. Re-run after every test migration: the estimates switch from assumed to **measured** throughput automatically."
+    echo
+    echo "## Decision"
+    echo
+    echo "**Strategy: \`$strategy\`** — $reason."
+    echo
+    echo "| Input | Value |"
+    echo "|---|---|"
+    echo "| Data to move | $(hb "$size") |"
+    echo "| Throughput | $(hb "$thr_bps")/s — $thr_src |"
+    echo "| Full load estimate | ~$fl_min min (~$fl_margin_min min with ${MARGIN_PCT}% margin) |"
+    echo "| Acceptable downtime | $DOWNTIME_MINUTES min |"
+    if [ "$strategy" = full-load ]; then
+      echo "| Expected downtime | ~$cut_full_min min (load + ${VALIDATE_MINUTES} validate + ${SWITCH_MINUTES} switch) |"
+    else
+      echo "| Expected downtime | ~$(( VALIDATE_MINUTES + SWITCH_MINUTES + 5 )) min (catch-up + validate + switch) |"
+      echo "| Acceptable replication lag | $MAX_LAG_SECONDS s |"
+      [ -z "$retain" ] || echo "| Log retention needed on source | ≥ $(hb "$retain") of WAL/binlog (initial copy + 24h buffer at the sampled rate) |"
+    fi
+    echo
+    echo "## Blockers — resolve before the test migration"
+    echo
+    if [ "${#pblock[@]}" -eq 0 ]; then echo "- none"; else for b in "${pblock[@]}"; do echo "- $b"; done; fi
+    if [ "$strategy" = "full-load+cdc" ] && [ -s "$STATE/cdc_issues.txt" ]; then
+      echo; echo "CDC issues:"; echo; bullets "$STATE/cdc_issues.txt"
+    fi
+    echo
+    echo "## Warnings"
+    echo
+    { cat "$STATE/warnings.txt"; [ "${#pwarn[@]}" -eq 0 ] || printf '%s\n' "${pwarn[@]}"; } > "$STATE/.w"; bullets "$STATE/.w"; rm -f "$STATE/.w"
+    echo
+    echo "## Schedule"
+    echo
+    echo "| Phase | Target date | Command | Exit criteria |"
+    echo "|---|---|---|---|"
+    echo "| 1. Requirements & plan | $today | \`assess\`, \`plan\` | No blockers; owners agree downtime, lag and deadline |"
+    echo "| 2. Test migration | $d_test | \`run --phase test\` | Validation passes; timings recorded |"
+    echo "| 3. Tuning & plan review | $d_tune | \`plan\` (re-run), adjust \`JOBS\`, excluded data, instance sizes | Measured estimate fits the window with margin |"
+    echo "| 4. Rehearsal | $d_reh | \`run --phase rehearsal\` against a production-sized copy | Whole runbook timed end to end, within the window |"
+    echo "| 5. Production cutover | $d_cut | \`cutover\` | Validation passes; apps switched; source kept read-only as fallback |"
+    [ -z "$DEADLINE" ] || { echo; echo "Deadline: **$DEADLINE** (cutover planned one week earlier as buffer for a retry). Schedule realistic: **$sched_ok**."; }
+    echo
+    echo "## Runbook"
+    echo
+    if [ "$strategy" = full-load ]; then
+      cat <<EOF
+Cutover day (inside the $DOWNTIME_MINUTES-minute window):
+
+1. Announce the window; stop application writes to the source.
+2. \`$PROG cutover $CONF\` — full load into the empty production target, then validation.
+3. Create users/roles/grants on the target; switch application connection strings.
+4. Smoke-test the application; keep the source untouched (read-only) as the fallback.
+EOF
+    else
+      cat <<EOF
+Days before cutover:
+
+1. \`$PROG full-load $CONF --phase cutover\` — $( [ "$SRC_ENGINE" = postgres ] && echo "schema only; the data is copied by the subscription" || echo "full dump with the binlog position recorded" ).
+2. \`$PROG cdc start $CONF\` and watch \`$PROG cdc status $CONF\` until it reports caught up and stays within $MAX_LAG_SECONDS s.
+3. Freeze schema changes on the source until cutover.
+
+Cutover day:
+
+1. Stop application writes to the source.
+2. \`$PROG cutover $CONF\` — waits for zero lag, copies sequences, validates, stops CDC.
+3. Create users/roles/grants on the target; switch application connection strings.
+4. Smoke-test; keep the source read-only as the fallback.
+EOF
+    fi
+    cat <<EOF
+
+## Rollback
+
+Until applications write to the target, rollback is simply "keep using the source". After the switch, writes made to the target do not exist on the source: decide in advance how long the fallback window is and what happens to those writes.
+
+## Things to schedule around
+
+- Managed-service maintenance windows and backup windows (RDS/Aurora/Atlas) on both sides: keep them away from the full load — a load interrupted mid-table must be restarted.
+- Engine end-of-support dates: migrating onto a version that leaves support during the project means planning the upgrade too.$( [ "$PURPOSE" = replication ] && echo "
+- Long-term replication: include engine upgrade tests and a lag alert at $MAX_LAG_SECONDS s from the start." )
+EOF
+  } > "$f"
+  ok "plan written: $f"
+  info "strategy: $strategy — $reason"
+  [ "${#pblock[@]}" -eq 0 ] || { warn "${#pblock[@]} blocker(s) — see the plan"; printf '     - %s\n' "${pblock[@]}" >&2; }
+}
+
+# ── full load ───────────────────────────────────────────────────────────────
+
+target_is_empty() {
+  local n
+  case "$TGT_ENGINE" in
+    postgres) n="$(q tgt "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p','v','m','S','f') AND n.nspname IN ($(pg_schema_list))")" ;;
+    mariadb|mysql) n="$(QDB='' q tgt "SELECT (SELECT count(*) FROM information_schema.tables WHERE table_schema = '$TGT_DB') + (SELECT count(*) FROM information_schema.routines WHERE routine_schema = '$TGT_DB')")" ;;
+    mongodb) n="$(js tgt 'print(db.getCollectionNames().filter(n => !n.startsWith("system.")).length)')" ;;
+  esac
+  [ "$n" = 0 ]
+}
+
+full_load_postgres() {
+  local mode="$1" s args="" own="--no-owner --no-privileges" lo
+  [ "$PG_KEEP_OWNERSHIP" = true ] && own=""
+  for s in $SCHEMAS; do args+=" -n '$s'"; done
+  args+=" -e '*'"   # with -n, extensions are left out unless asked for
+  lo="$(q src "SELECT count(*) FROM pg_largeobject_metadata")"
+  [ "$lo" = 0 ] || [ "$mode" = schema ] || args+=" -b"
+  if [ "$mode" = schema ]; then
+    args+=" --schema-only"
+  else
+    for s in $EXCLUDE_DATA_TABLES; do args+=" --exclude-table-data='$s'"; done
+  fi
+
+  local errf="$STATE/load.err" st
+  : > "$errf"
+  set +e
+  if [ "$JOBS" -gt 1 ] && [ "$mode" = full ]; then
+    info "parallel: pg_dump -Fd -j $JOBS and pg_restore -j $JOBS through a temporary directory (needs free space ≈ the dump size $( [ "$CLIENT_MODE" = docker ] && echo 'inside the container' || echo 'in $TMPDIR' ))"
+    use tgt
+    export DBM_H2="$DBM_H" DBM_P2="$DBM_P" DBM_U2="$DBM_U" DBM_D2="$DBM_D" DBM_PW2="$PGPASSWORD" DBM_TLS2="$PGSSLMODE"
+    use src
+    client postgres "d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT
+      pg_dump -h \"\$DBM_H\" -p \"\$DBM_P\" -U \"\$DBM_U\" -d \"\$DBM_D\" -Fd -j $JOBS -f \"\$d/dump\" --strict-names $args || exit 90
+      PGPASSWORD=\"\$DBM_PW2\" PGSSLMODE=\"\$DBM_TLS2\" pg_restore -h \"\$DBM_H2\" -p \"\$DBM_P2\" -U \"\$DBM_U2\" -d \"\$DBM_D2\" -j $JOBS $own \"\$d/dump\"" 2> "$errf"
+    st=$?
+    [ "$st" -ne 90 ] || { set -e; cat "$errf" >&2; die "pg_dump failed on the source"; }
+  else
+    ( use src; client postgres "pg_dump -h \"\$DBM_H\" -p \"\$DBM_P\" -U \"\$DBM_U\" -d \"\$DBM_D\" -Fc --strict-names $args" ) 2> "$STATE/dump.err" \
+      | ( use tgt; client postgres "pg_restore -h \"\$DBM_H\" -p \"\$DBM_P\" -U \"\$DBM_U\" -d \"\$DBM_D\" $own" ) 2> "$errf"
+    local -a ps=("${PIPESTATUS[@]}")
+    [ "${ps[0]}" -eq 0 ] || { set -e; cat "$STATE/dump.err" >&2; die "pg_dump failed on the source (see above)"; }
+    st="${ps[1]}"
+  fi
+  set -e
+  # pg_restore keeps going past errors and exits 1 at the end. Some are
+  # expected on any target (the schema or extension already exists, or the
+  # target user may not COMMENT ON an extension it does not own); anything
+  # else is a real failure.
+  if [ "$st" -ne 0 ]; then
+    local real
+    real="$(grep -E '^pg_restore: error:' "$errf" | grep -Ev '(schema|extension) "[^"]+" already exists|must be owner of extension|unrecognized configuration parameter "transaction_timeout"' || true)"
+    if [ -n "$real" ]; then
+      printf '%s\n' "$real" >&2
+      die "pg_restore reported errors (full log: $errf)"
+    fi
+    info "pg_restore: only expected 'already exists' errors (logged in $errf)"
+  fi
+}
+
+full_load_mysqlish() {
+  local mode="$1" want_coords="$2"
+  local dump_bin flags coords="$STATE/binlog.coords" s
+  rm -f "$coords"
+  if [ "$SRC_ENGINE" = mariadb ]; then dump_bin=mariadb-dump; else dump_bin=mysqldump; fi
+  flags="--single-transaction --quick --routines --triggers --events --hex-blob --default-character-set=utf8mb4"
+  [ "$SRC_ENGINE" = mysql ] && flags+=" --set-gtid-purged=OFF --column-statistics=0"
+  if [ "$want_coords" = 1 ]; then
+    if [ "$SRC_ENGINE" = mariadb ]; then flags+=" --master-data=2"; else flags+=" --source-data=2"; fi
+  fi
+  local mysql_excl=""
+  for s in $EXCLUDE_DATA_TABLES; do
+    if [ "$SRC_ENGINE" = mariadb ]; then flags+=" --ignore-table-data='$SRC_DB.$s'"
+    else flags+=" --ignore-table='$SRC_DB.$s'"; mysql_excl+=" '$s'"; fi
+  done
+  [ "$mode" = full ] || flags+=" --no-data"
+
+  local cs="${SRC_ENCODING:-utf8mb4}" coll="${SRC_COLLATION:-}"
+  [ "$TGT_ENGINE" = "$SRC_ENGINE" ] || coll=""
+  QDB='' q tgt "CREATE DATABASE IF NOT EXISTS \`$TGT_DB\` CHARACTER SET $cs${coll:+ COLLATE $coll}" >/dev/null
+
+  local load_cmd
+  if [ "$TGT_ENGINE" = mariadb ]; then load_cmd='mariadb $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" --default-character-set=utf8mb4 "$DBM_D"'
+  else load_cmd='mysql $DBM_TLS -h "$DBM_H" -P "$DBM_P" -u "$DBM_U" --default-character-set=utf8mb4 "$DBM_D"'; fi
+
+  set +e
+  ( use src; client "$SRC_ENGINE" "$dump_bin \$DBM_TLS -h \"\$DBM_H\" -P \"\$DBM_P\" -u \"\$DBM_U\" $flags \"\$DBM_D\"" ) 2> "$STATE/dump.err" \
+    | LC_ALL=C awk -v f="$coords" -v strip="$STRIP_DEFINERS" '
+        !done && /^-- CHANGE (MASTER|REPLICATION SOURCE) TO/ { print > f; close(f); done = 1 }
+        strip == "true" && /DEFINER=`/ { gsub(/DEFINER=`[^`]*`@`[^`]*`/, "") }
+        { print }' \
+    | ( use tgt; client "$TGT_ENGINE" "$load_cmd" ) 2> "$STATE/load.err"
+  local -a ps=("${PIPESTATUS[@]}")
+  set -e
+  [ "${ps[0]}" -eq 0 ] || { cat "$STATE/dump.err" >&2; die "$dump_bin failed on the source (see above)"; }
+  [ "${ps[2]}" -eq 0 ] || { cat "$STATE/load.err" >&2; die "loading into the target failed (see above)"; }
+
+  if [ -n "$mysql_excl" ] && [ "$mode" = full ]; then
+    info "creating the excluded tables empty"
+    ( use src; client mysql "mysqldump \$DBM_TLS -h \"\$DBM_H\" -P \"\$DBM_P\" -u \"\$DBM_U\" --no-data --set-gtid-purged=OFF --column-statistics=0 \"\$DBM_D\" $mysql_excl" ) \
+      | ( use tgt; client "$TGT_ENGINE" "$load_cmd" ) || die "creating the excluded tables failed"
+  fi
+  if [ "$want_coords" = 1 ]; then
+    [ -s "$coords" ] || die "the dump did not record a binlog position (is log_bin on, and does $SRC_USER have RELOAD?)"
+    ok "binlog position recorded: $(sed 's/^-- //' "$coords")"
+  fi
+}
+
+full_load_mongodb() {
+  local excl="" s
+  for s in $EXCLUDE_DATA_TABLES; do excl+=" --excludeCollection='$s'"; done
+  set +e
+  ( use src; client mongodb "$MCFG mongodump --config=\"\$c\" --db=\"\$DBM_D\" --archive --gzip $excl" ) 2> "$STATE/dump.err" \
+    | ( use tgt; client mongodb "$MCFG mongorestore --config=\"\$c\" --archive --gzip --nsFrom=\"\$DBM_SRCDB.*\" --nsTo=\"\$DBM_D.*\" --stopOnError --numInsertionWorkersPerCollection=$JOBS" ) 2> "$STATE/load.err"
+  local -a ps=("${PIPESTATUS[@]}")
+  set -e
+  [ "${ps[0]}" -eq 0 ] || { cat "$STATE/dump.err" >&2; die "mongodump failed on the source (see above)"; }
+  [ "${ps[1]}" -eq 0 ] || { tail -20 "$STATE/load.err" >&2; die "mongorestore failed on the target (full log: $STATE/load.err)"; }
+}
+
+cmd_full_load() {
+  require_supported_pair
+  load_assessment
+  load_plan
+  local phase="${OPT_PHASE:-test}" mode=full coords=0
+  if [ "$STRATEGY" = "full-load+cdc" ]; then
+    case "$SRC_ENGINE" in
+      postgres) mode=schema ;;
+      mariadb|mysql) homogeneous || die "CDC between $SRC_ENGINE and $TGT_ENGINE is not supported — use --strategy full-load"; coords=1 ;;
+      mongodb) die "the plan needs CDC, which this tool cannot do for MongoDB (see plan.md) — use --strategy full-load to accept a full write freeze" ;;
+    esac
+  fi
+
+  log "full load ($phase): $SRC_ENGINE $SRC_HOST/$SRC_DB → $TGT_ENGINE $TGT_HOST/$TGT_DB"
+  if ! target_is_empty; then
+    die "the target already contains objects in the migrated schema/database. Load only into an empty target (drop it and recreate it for a re-test)."
+  fi
+  [ "$mode" = schema ] && info "strategy $STRATEGY: copying the SCHEMA only — the subscription copies the data (cdc start)"
+  [ "$coords" = 1 ] && info "strategy $STRATEGY: full dump, recording the binlog position for CDC"
+
+  local t0 secs
+  t0="$(now)"
+  echo "$mode" > "$STATE/load.mode"
+  record_run "$phase" "full-load-started" 0 0 "-"
+  case "$SRC_ENGINE" in
+    postgres) full_load_postgres "$mode" ;;
+    mariadb|mysql) full_load_mysqlish "$mode" "$coords" ;;
+    mongodb) full_load_mongodb ;;
+  esac
+  secs=$(( $(now) - t0 )); [ "$secs" -ge 1 ] || secs=1
+  if [ "$mode" = full ]; then
+    record_run "$phase" "full-load" "$secs" "${SIZE_BYTES:-0}" ok
+    ok "full load done in ${secs}s ($(hb $(( ${SIZE_BYTES:-0} / secs )))/s)"
+  else
+    record_run "$phase" "schema-load" "$secs" 0 ok
+    ok "schema loaded in ${secs}s"
+  fi
+  echo "$phase" > "$STATE/phase"
+}
+
+# ── CDC ─────────────────────────────────────────────────────────────────────
+
+pg_conninfo_val() { local v="${1//\\/\\\\}"; v="${v//\'/\\\'}"; printf "'%s'" "$v"; }
+sql_lit()         { printf '%s' "${1//\'/\'\'}"; }
+my_lit()          { local v="${1//\\/\\\\}"; printf '%s' "${v//\'/\\\'}"; }
+
+cdc_start_postgres() {
+  local row
+  [ "$(cat "$STATE/load.mode" 2>/dev/null)" = schema ] \
+    || die "CDC copies the data itself, so the target must have been loaded with the SCHEMA only (strategy full-load+cdc). Empty the target and run full-load with that plan."
+  [ "$(q src "SELECT current_setting('wal_level')")" = logical ] || die "source wal_level is not 'logical' — see the CDC issues in assessment.md"
+  [ -z "$(q src "SELECT 1 FROM pg_publication WHERE pubname = '$PUB'")" ] || die "publication $PUB already exists on the source — CDC is already started (cdc status / cdc stop)"
+  local sl ex
+  sl="$(pg_schema_list)"; ex="$(pg_excl_list)"
+  row="$(q src "SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($sl) AND (c.relreplident = 'n' OR (c.relreplident = 'd' AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = c.oid AND k.contype = 'p'))) AND n.nspname || '.' || c.relname NOT IN ($ex)")"
+  [ -z "$row" ] || die "these tables have no primary key / replica identity; publishing them would make UPDATE/DELETE FAIL ON THE SOURCE: $row. Fix with ALTER TABLE … REPLICA IDENTITY FULL (or add a primary key), or list them in EXCLUDE_DATA_TABLES."
+  local tables
+  tables="$(q src "SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($sl) AND n.nspname || '.' || c.relname NOT IN ($ex)")"
+  [ -n "$tables" ] || die "no tables to publish"
+
+  local pw="${REPL_PASSWORD:-${SRC_PASSWORD:-}}" ssl="${SRC_SSL:-prefer}"
+  [ "$ssl" = verify ] && ssl=verify-full
+  local conn="host=$(pg_conninfo_val "$REPL_HOST") port=$REPL_PORT dbname=$(pg_conninfo_val "$SRC_DB") user=$(pg_conninfo_val "$REPL_USER") password=$(pg_conninfo_val "$pw") sslmode=$ssl"
+
+  log "source: CREATE PUBLICATION $PUB"
+  q src "CREATE PUBLICATION $PUB FOR TABLE $tables" >/dev/null
+  log "target: CREATE SUBSCRIPTION $PUB (connects to $REPL_HOST:$REPL_PORT FROM THE TARGET SERVER)"
+  if ! q tgt "CREATE SUBSCRIPTION $PUB CONNECTION '$(sql_lit "$conn")' PUBLICATION $PUB WITH (copy_data = true)" >/dev/null; then
+    q src "DROP PUBLICATION IF EXISTS $PUB" >/dev/null || true
+    die "creating the subscription failed. The TARGET server must reach $REPL_HOST:$REPL_PORT (set REPL_HOST if the source has a different address from there), and $TGT_USER needs superuser / rds_superuser / pg_create_subscription. The publication was removed again."
+  fi
+  info "note: the connection string (with password) is stored in the target's pg_subscription catalog until cdc stop"
+}
+
+cdc_start_mysqlish() {
+  homogeneous || die "CDC between $SRC_ENGINE and $TGT_ENGINE is not supported"
+  [ "$SRC_DB" = "$TGT_DB" ] || die "CDC needs SRC_DB and TGT_DB to be the same name"
+  local coords="$STATE/binlog.coords" file pos
+  [ -s "$coords" ] || die "no binlog position recorded — run full-load with the full-load+cdc plan first"
+  file="$(sed -n "s/.*LOG_FILE='\([^']*\)'.*/\1/p" "$coords")"
+  pos="$(sed -n 's/.*LOG_POS=\([0-9]*\).*/\1/p' "$coords")"
+  [ -n "$file" ] && [ -n "$pos" ] || die "could not parse $coords"
+  local pw="${REPL_PASSWORD:-${SRC_PASSWORD:-}}" sql
+  local h; h="$(my_lit "$REPL_HOST")"; local u; u="$(my_lit "$REPL_USER")"; local p; p="$(my_lit "$pw")"
+  if [ "$TGT_MANAGED" = rds ]; then
+    if [ "$TGT_ENGINE" = mariadb ]; then
+      sql="CALL mysql.rds_set_external_master('$h', $REPL_PORT, '$u', '$p', '$file', $pos, 0); CALL mysql.rds_start_replication;"
+    else
+      sql="CALL mysql.rds_set_external_source('$h', $REPL_PORT, '$u', '$p', '$file', $pos, 0); CALL mysql.rds_start_replication;"
+    fi
+    warn "RDS target: set replicate-do-db=$TGT_DB in the target's parameter group, or every database on the source is replicated"
+  elif [ "$TGT_ENGINE" = mariadb ]; then
+    sql="STOP SLAVE; SET GLOBAL replicate_do_db = '$(my_lit "$TGT_DB")'; CHANGE MASTER TO MASTER_HOST='$h', MASTER_PORT=$REPL_PORT, MASTER_USER='$u', MASTER_PASSWORD='$p', MASTER_LOG_FILE='$file', MASTER_LOG_POS=$pos; START SLAVE;"
+  else
+    sql="STOP REPLICA; CHANGE REPLICATION FILTER REPLICATE_DO_DB = (\`$TGT_DB\`); CHANGE REPLICATION SOURCE TO SOURCE_HOST='$h', SOURCE_PORT=$REPL_PORT, SOURCE_USER='$u', SOURCE_PASSWORD='$p', SOURCE_LOG_FILE='$file', SOURCE_LOG_POS=$pos, GET_SOURCE_PUBLIC_KEY=1; START REPLICA;"
+  fi
+  log "target: start replication from $file:$pos (the TARGET server connects to $REPL_HOST:$REPL_PORT)"
+  q tgt "$sql" >/dev/null
+}
+
+cmd_cdc() {
+  local sub="${1:-}"
+  require_supported_pair
+  case "$sub" in
+    start)
+      load_assessment
+      case "$SRC_ENGINE" in
+        postgres) cdc_start_postgres ;;
+        mariadb|mysql) cdc_start_mysqlish ;;
+        mongodb) die "no native CDC for MongoDB in this tool — use mongosync or AWS DMS (see plan.md)" ;;
+      esac
+      now > "$STATE/cdc.started"; rm -f "$STATE/cdc.synced"
+      ok "CDC started. Watch it with: $PROG cdc status $CONF   (or: $PROG cdc wait $CONF)" ;;
+    status) cdc_status; return $? ;;
+    wait)   cdc_wait "${OPT_TIMEOUT:-0}" ;;
+    stop)   cdc_stop ;;
+    *) die "usage: $PROG cdc <start|status|wait|stop> <config>" ;;
+  esac
+}
+
+# cdc_status — prints the state; returns 0 when caught up, 2 when not yet.
+cdc_status() {
+  local caught=1
+  case "$SRC_ENGINE" in
+    postgres)
+      local row pending total active lag age
+      row="$(q tgt "SELECT count(*) FILTER (WHERE r.srsubstate <> 'r'), count(*) FROM pg_subscription s JOIN pg_subscription_rel r ON r.srsubid = s.oid WHERE s.subname = '$PUB'")"
+      IFS='|' read -r pending total <<<"$row"
+      [ "${total:-0}" -gt 0 ] || die "no subscription $PUB on the target — CDC is not running"
+      row="$(q src "SELECT active::text, coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint FROM pg_replication_slots WHERE slot_name = '$PUB'")"
+      IFS='|' read -r active lag <<<"$row"
+      age="$(q tgt "SELECT coalesce(extract(epoch FROM now() - latest_end_time)::int, -1) FROM pg_stat_subscription WHERE subname = '$PUB' AND relid IS NULL")"
+      info "tables in initial copy: $pending of $total still copying"
+      info "slot active: ${active:-missing}   lag: $(hb "${lag:-0}")   last message from source: ${age:-?}s ago"
+      if [ "$pending" = 0 ] && [ "${active:-f}" = true ] && [ "${lag:-0}" -le "$CDC_MAX_LAG_BYTES" ]; then caught=0; fi
+      if [ "$pending" = 0 ] && [ ! -f "$STATE/cdc.synced" ] && [ -f "$STATE/cdc.started" ]; then
+        local secs=$(( $(now) - $(cat "$STATE/cdc.started") ))
+        load_assessment
+        record_run "$(cat "$STATE/phase" 2>/dev/null || echo test)" "initial-sync" "$secs" "${SIZE_BYTES:-0}" ok
+        touch "$STATE/cdc.synced"
+        ok "initial copy finished in ${secs}s — recorded for planning"
+      fi ;;
+    mariadb|mysql)
+      local out io sqlr behind err
+      if [ "$TGT_ENGINE" = mariadb ]; then out="$(qv tgt "SHOW SLAVE STATUS")"; else out="$(qv tgt "SHOW REPLICA STATUS")"; fi
+      [ -n "$out" ] || die "replication is not configured on the target — CDC is not running"
+      io="$(awk -F': ' '/(Slave|Replica)_IO_Running:/ {print $2}' <<<"$out")"
+      sqlr="$(awk -F': ' '/(Slave|Replica)_SQL_Running:/ {print $2}' <<<"$out")"
+      behind="$(awk -F': ' '/Seconds_Behind_(Master|Source):/ {print $2}' <<<"$out")"
+      err="$(awk -F': ' '/Last_(IO_|SQL_)?Error: ./ {print $2}' <<<"$out" | head -1)"
+      info "IO thread: $io   SQL thread: $sqlr   seconds behind: $behind"
+      [ -z "$err" ] || warn "last error: $err"
+      if [ "$io" = Yes ] && [ "$sqlr" = Yes ] && [ "$behind" != NULL ] && [ "${behind:-999999}" -le "$MAX_LAG_SECONDS" ]; then caught=0; fi
+      if [ "$caught" = 0 ] && [ ! -f "$STATE/cdc.synced" ] && [ -f "$STATE/cdc.started" ]; then
+        touch "$STATE/cdc.synced"
+        record_run "$(cat "$STATE/phase" 2>/dev/null || echo test)" "cdc-caught-up" "$(( $(now) - $(cat "$STATE/cdc.started") ))" 0 ok
+      fi ;;
+    mongodb) die "no CDC for MongoDB in this tool" ;;
+  esac
+  if [ "$caught" = 0 ]; then ok "caught up"; return 0; fi
+  info "not caught up yet"; return 2
+}
+
+cdc_wait() { # cdc_wait <timeout minutes, 0 = forever>
+  local limit="$1" t0; t0="$(now)"
+  while true; do
+    if cdc_status; then return 0; fi
+    if [ "$limit" -gt 0 ] && [ $(( $(now) - t0 )) -ge $(( limit * 60 )) ]; then
+      die "CDC did not catch up within $limit minutes"
+    fi
+    sleep 15
+  done
+}
+
+cdc_stop() {
+  log "stopping CDC"
+  case "$SRC_ENGINE" in
+    postgres)
+      if [ -n "$(q tgt "SELECT 1 FROM pg_subscription WHERE subname = '$PUB'")" ]; then
+        q tgt "DROP SUBSCRIPTION $PUB" >/dev/null || die "DROP SUBSCRIPTION failed on the target"
+        ok "subscription dropped on the target"
+      fi
+      q src "DROP PUBLICATION IF EXISTS $PUB" >/dev/null && ok "publication dropped on the source"
+      # A slot left behind holds WAL on the source forever and eventually fills its disk.
+      if [ -n "$(q src "SELECT 1 FROM pg_replication_slots WHERE slot_name = '$PUB'")" ]; then
+        q src "SELECT pg_drop_replication_slot('$PUB')" >/dev/null && ok "replication slot $PUB dropped on the source"
+      fi ;;
+    mariadb|mysql)
+      local sql
+      if [ "$TGT_MANAGED" = rds ]; then
+        if [ "$TGT_ENGINE" = mariadb ]; then sql="CALL mysql.rds_stop_replication; CALL mysql.rds_reset_external_master;"
+        else sql="CALL mysql.rds_stop_replication; CALL mysql.rds_reset_external_source;"; fi
+      elif [ "$TGT_ENGINE" = mariadb ]; then sql="STOP SLAVE; RESET SLAVE ALL; SET GLOBAL replicate_do_db = '';"
+      else sql="STOP REPLICA; RESET REPLICA ALL; CHANGE REPLICATION FILTER REPLICATE_DO_DB = ();"; fi
+      q tgt "$sql" >/dev/null && ok "replication stopped and reset on the target" ;;
+    mongodb) die "no CDC for MongoDB in this tool" ;;
+  esac
+  rm -f "$STATE/cdc.started"
+}
+
+# ── validate ────────────────────────────────────────────────────────────────
+
+# table_list <side> — one quoted table name per line
+table_list() {
+  case "$C_ENGINE_OF" in
+    postgres) q "$1" "SELECT format('%I.%I', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ($(pg_schema_list)) ORDER BY 1" ;;
+    mariadb|mysql) q "$1" "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY 1" ;;
+  esac
+}
+
+# counts <side> <file with table names> — "name|count[/checksum]" per table
+counts() {
+  local side="$1" list="$2" sql="" n=0 t lit
+  local chk="${OPT_CHECKSUM:-0}"
+  flush() {
+    [ -n "$sql" ] || return 0
+    q "$side" "$sql"; sql=""; n=0
+  }
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    case "$C_ENGINE_OF" in
+      postgres)
+        lit="$(sql_lit "$t")"
+        if [ "$chk" = 1 ]; then
+          sql+="${sql:+ UNION ALL }SELECT '$lit', count(*)::text || '/' || coalesce(md5(string_agg(md5(x::text), '' ORDER BY md5(x::text))), '-') FROM $t x"
+        else
+          sql+="${sql:+ UNION ALL }SELECT '$lit', count(*)::text FROM $t"
+        fi ;;
+      mariadb|mysql)
+        lit="$(my_lit "$t")"
+        sql+="${sql:+ UNION ALL }SELECT '$lit', COUNT(*) FROM \`${t//\`/\`\`}\`" ;;
+    esac
+    n=$(( n + 1 ))
+    [ "$n" -lt 300 ] || flush
+  done < "$list"
+  flush
+  if [ "$chk" = 1 ] && [ "$C_ENGINE_OF" != postgres ]; then
+    local tl=""
+    while IFS= read -r t; do [ -n "$t" ] && tl+="${tl:+, }\`${t//\`/\`\`}\`"; done < "$list"
+    [ -z "$tl" ] || q "$side" "CHECKSUM TABLE $tl" | sed 's/^[^.|]*\.//' > "$STATE/.chk.$side"
+  fi
+}
+
+objects() { # objects <side> — "kind|count" lines
+  case "$C_ENGINE_OF" in
+    postgres)
+      local sl; sl="$(pg_schema_list)"
+      q "$1" "SELECT 'views', count(*) FROM pg_views WHERE schemaname IN ($sl) UNION ALL SELECT 'materialized views', count(*) FROM pg_matviews WHERE schemaname IN ($sl) UNION ALL SELECT 'functions', count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname IN ($sl) UNION ALL SELECT 'sequences', count(*) FROM pg_sequences WHERE schemaname IN ($sl) UNION ALL SELECT 'indexes', count(*) FROM pg_indexes WHERE schemaname IN ($sl) UNION ALL SELECT 'constraints', count(*) FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace WHERE n.nspname IN ($sl) UNION ALL SELECT 'triggers', count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT t.tgisinternal AND n.nspname IN ($sl)" ;;
+    mariadb|mysql)
+      q "$1" "SELECT 'views', count(*) FROM information_schema.views WHERE table_schema = DATABASE() UNION ALL SELECT 'routines', count(*) FROM information_schema.routines WHERE routine_schema = DATABASE() UNION ALL SELECT 'triggers', count(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE() UNION ALL SELECT 'events', count(*) FROM information_schema.events WHERE event_schema = DATABASE() UNION ALL SELECT 'indexes', count(DISTINCT table_name, index_name) FROM information_schema.statistics WHERE table_schema = DATABASE()" ;;
+  esac
+}
+
+cmd_validate() {
+  require_supported_pair
+  local out="$STATE/validation.md" fail=0 n t s d
+  C_ENGINE_OF="$SRC_ENGINE"
+  log "validating: row counts$( [ "${OPT_CHECKSUM:-0}" = 1 ] && echo ' and checksums' ) and object counts, source vs target"
+  local sa="$STATE/.src" ta="$STATE/.tgt"
+  : > "$sa"; : > "$ta"; rm -f "$STATE/.chk.src" "$STATE/.chk.tgt"
+
+  if [ "$SRC_ENGINE" = mongodb ]; then
+    local jsc
+    jsc='const h = '"$( [ "${OPT_CHECKSUM:-0}" = 1 ] && echo 'db.runCommand({ dbHash: 1 }).collections || {}' || echo '{}' )"';
+      db.getCollectionInfos({ type: "collection" }).map(c => c.name).filter(n => !n.startsWith("system.")).sort()
+        .forEach(n => print(n + "|" + db.getCollection(n).countDocuments({}) + (h[n] ? "/" + h[n] : "") + "|" + db.getCollection(n).getIndexes().length));'
+    js src "$jsc" > "$sa"; js tgt "$jsc" > "$ta"
+  else
+    table_list src > "$STATE/.tables.src"; table_list tgt > "$STATE/.tables.tgt"
+    comm -12 <(sort "$STATE/.tables.src") <(sort "$STATE/.tables.tgt") > "$STATE/.tables.both"
+    counts src "$STATE/.tables.both" | sort > "$sa"
+    counts tgt "$STATE/.tables.both" | sort > "$ta"
+    if [ -f "$STATE/.chk.src" ]; then
+      join -t'|' <(sort "$sa") <(sort "$STATE/.chk.src") | awk -F'|' '{print $1 "|" $2 "/" $3}' > "$sa.j"; mv "$sa.j" "$sa"
+      join -t'|' <(sort "$ta") <(sort "$STATE/.chk.tgt") | awk -F'|' '{print $1 "|" $2 "/" $3}' > "$ta.j"; mv "$ta.j" "$ta"
+    fi
+  fi
+
+  {
+    echo "# Validation — $MIGRATION_NAME"
+    echo
+    echo "Run $(date -u +%FT%TZ). $( [ "${OPT_CHECKSUM:-0}" = 1 ] && echo 'Row counts and content checksums.' || echo 'Row counts (add --checksum to compare content too).' )"
+    echo
+    echo "Counts are exact only when nothing is writing to the source, or CDC has caught up after writes stopped."
+    echo
+    echo "## Tables"
+    echo
+    echo "| Table | Source | Target | |"
+    echo "|---|---|---|---|"
+  } > "$out"
+
+  local tgtval
+  while IFS='|' read -r n s _; do
+    [ -n "$n" ] || continue
+    tgtval="$(awk -F'|' -v k="$n" '$1 == k { print $2; exit }' "$ta")"
+    local plain="${n//\"/}"
+    if is_excluded "$plain" || is_excluded "${plain#*.}"; then
+      echo "| \`$n\` | $s | ${tgtval:--} | data excluded |" >> "$out"
+    elif [ -z "$tgtval" ]; then
+      echo "| \`$n\` | $s | missing | ❌ |" >> "$out"; fail=$(( fail + 1 ))
+    elif [ "$s" = "$tgtval" ]; then
+      echo "| \`$n\` | $s | $tgtval | ✅ |" >> "$out"
+    else
+      echo "| \`$n\` | $s | $tgtval | ❌ |" >> "$out"; fail=$(( fail + 1 ))
+    fi
+  done < "$sa"
+  if [ "$SRC_ENGINE" != mongodb ]; then
+    while IFS= read -r t; do
+      [ -n "$t" ] && { echo "| \`$t\` | present | missing | ❌ |" >> "$out"; fail=$(( fail + 1 )); }
+    done < <(comm -23 <(sort "$STATE/.tables.src") <(sort "$STATE/.tables.tgt"))
+  fi
+
+  {
+    echo
+    echo "## Other objects"
+    echo
+    echo "| Kind | Source | Target | |"
+    echo "|---|---|---|---|"
+  } >> "$out"
+  if [ "$SRC_ENGINE" = mongodb ]; then
+    local si=0 ti=0 x
+    while IFS='|' read -r n _ x; do [ -n "$n" ] && ! is_excluded "$n" && si=$(( si + x )); done < "$sa"
+    while IFS='|' read -r n _ x; do [ -n "$n" ] && ! is_excluded "$n" && ti=$(( ti + x )); done < "$ta"
+    if [ "$si" = "$ti" ]; then echo "| indexes | $si | $ti | ✅ |" >> "$out"; else echo "| indexes | $si | $ti | ❌ |" >> "$out"; fail=$(( fail + 1 )); fi
+  else
+    local so to
+    so="$(objects src)"; to="$(objects tgt)"
+    while IFS='|' read -r n s; do
+      [ -n "$n" ] || continue
+      d="$(awk -F'|' -v k="$n" '$1 == k { print $2 }' <<<"$to")"
+      if [ "$s" = "$d" ]; then echo "| $n | $s | $d | ✅ |" >> "$out"
+      else echo "| $n | $s | $d | ❌ |" >> "$out"; fail=$(( fail + 1 )); fi
+    done <<<"$so"
+  fi
+  rm -f "$sa" "$ta" "$STATE"/.tables.* "$STATE"/.chk.*
+
+  echo >> "$out"
+  if [ "$fail" -eq 0 ]; then
+    echo "**Result: PASS**" >> "$out"
+    record_run "$(cat "$STATE/phase" 2>/dev/null || echo test)" validate 0 0 ok
+    ok "validation passed — $out"
+    return 0
+  fi
+  echo "**Result: FAIL — $fail difference(s)**" >> "$out"
+  record_run "$(cat "$STATE/phase" 2>/dev/null || echo test)" validate 0 0 "fail:$fail"
+  warn "validation FAILED: $fail difference(s) — $out"
+  grep '❌' "$out" | head -20 >&2
+  return 1
+}
+
+# ── run (test / rehearsal) ──────────────────────────────────────────────────
+
+cmd_run() {
+  require_supported_pair
+  load_assessment; load_plan
+  local phase="${OPT_PHASE:-test}" t0
+  [ "$phase" != cutover ] || die "use '$PROG cutover' for production"
+  t0="$(now)"
+  log "end-to-end $phase migration — strategy $STRATEGY"
+  OPT_PHASE="$phase" cmd_full_load
+  if [ "$STRATEGY" = "full-load+cdc" ]; then
+    cmd_cdc start
+    log "waiting for CDC to catch up (timeout ${OPT_TIMEOUT:-120} min)"
+    cdc_wait "${OPT_TIMEOUT:-120}"
+  fi
+  local vr=0
+  cmd_validate || vr=$?
+  if [ "$STRATEGY" = "full-load+cdc" ] && [ "${OPT_KEEP_CDC:-0}" != 1 ]; then cdc_stop; fi
+  local secs=$(( $(now) - t0 ))
+  record_run "$phase" "end-to-end" "$secs" "${SIZE_BYTES:-0}" "$( [ "$vr" = 0 ] && echo ok || echo fail )"
+  echo
+  ok "$phase migration took $(( secs / 60 ))m$(( secs % 60 ))s end to end"
+  info "next: re-plan with the measured numbers →  $PROG plan $CONF"
+  info "report of all runs →  $PROG report $CONF"
+  return "$vr"
+}
+
+# ── cutover ─────────────────────────────────────────────────────────────────
+
+cmd_cutover() {
+  require_supported_pair
+  load_assessment; load_plan
+  echo cutover > "$STATE/phase"
+  local blockers
+  blockers="$(grep -c . "$STATE/blockers.txt" || true)"
+  [ "$blockers" = 0 ] || [ "${OPT_FORCE:-0}" = 1 ] || die "the assessment still lists $blockers blocker(s). Fix them and re-run assess (or --force if they are accepted)."
+  grep -q '|rehearsal|end-to-end|.*|ok$' "$STATE/runs.log" 2>/dev/null \
+    || warn "no successful rehearsal is recorded for this migration"
+
+  confirm "$MIGRATION_NAME" "PRODUCTION CUTOVER: $SRC_HOST/$SRC_DB → $TGT_HOST/$TGT_DB, strategy $STRATEGY.
+Application writes to the source must be STOPPED before continuing."
+  local t0; t0="$(now)"
+
+  if [ "$STRATEGY" = full-load ]; then
+    OPT_PHASE=cutover cmd_full_load
+  else
+    log "waiting for CDC to drain (timeout $CUTOVER_WAIT_MINUTES min)"
+    cdc_wait "$CUTOVER_WAIT_MINUTES"
+    if [ "$SRC_ENGINE" = postgres ]; then
+      log "copying sequence values (logical replication does not carry them)"
+      local sql
+      sql="$(q src "SELECT coalesce(string_agg(format('SELECT setval(%L, %s, %s);', format('%I.%I', schemaname, sequencename), coalesce(last_value, start_value), CASE WHEN last_value IS NULL THEN 'false' ELSE 'true' END), ' '), '') FROM pg_sequences WHERE schemaname IN ($(pg_schema_list))")"
+      [ -z "$sql" ] || { q tgt "$sql" >/dev/null; ok "sequences copied"; }
+    fi
+  fi
+
+  # With CDC, a validation can fail only because the last changes are still in
+  # flight; give it a few chances before calling it a real difference.
+  local tries=1
+  [ "$STRATEGY" = full-load ] || tries=5
+  until cmd_validate; do
+    tries=$(( tries - 1 ))
+    [ "$tries" -gt 0 ] || die "validation failed — DO NOT switch the applications. CDC is still running; investigate $STATE/validation.md."
+    info "re-checking in 20s (changes may still be in flight)"; sleep 20
+  done
+
+  [ "$STRATEGY" = full-load ] || cdc_stop
+  record_run cutover end-to-end $(( $(now) - t0 )) "${SIZE_BYTES:-0}" ok
+  cat >&2 <<EOF
+
+  ✅ Data is on the target and validated ($(( ($(now) - t0) / 60 )) min). Now, in this order:
+
+     1. Create users / roles / grants on the target (not migrated): ${ROLES:-see assessment.md}
+     2. Point the applications at $TGT_HOST:$TGT_PORT/$TGT_DB and re-enable writes.
+     3. Smoke-test the application.
+     4. Keep the source read-only and untouched until the fallback window ends.
+EOF
+}
+
+# ── report / init / help ────────────────────────────────────────────────────
+
+cmd_report() {
+  [ -f "$STATE/runs.log" ] || die "no runs recorded yet"
+  printf '%-22s %-10s %-18s %10s %12s %s\n' WHEN PHASE STEP SECONDS THROUGHPUT RESULT
+  local w p s sec b r
+  while IFS='|' read -r w p s sec b r; do
+    [ "$s" = full-load-started ] && continue
+    local tp="-"
+    [ "$sec" -gt 0 ] && [ "$b" -gt 0 ] && tp="$(hb $(( b / sec )))/s"
+    printf '%-22s %-10s %-18s %10s %12s %s\n' "$w" "$p" "$s" "$sec" "$tp" "$r"
+  done < "$STATE/runs.log"
+  echo
+  echo "reports: $STATE/{assessment,plan,validation}.md"
+}
+
+cmd_init() {
+  local name="${1:-}" f
+  [ -n "$name" ] || die "usage: $PROG init <name>   (lowercase letters, digits, _)"
+  valid name "$name" '^[a-z0-9_]+$'
+  f="$PWD/$name.conf"
+  [ ! -e "$f" ] || die "$f already exists"
+  sed "s/^MIGRATION_NAME=.*/MIGRATION_NAME=$name/" "$HERE/migration.example.conf" > "$f"
+  ok "created $f — fill in the endpoints and requirements, then:"
+  info "export SRC_PASSWORD=… TGT_PASSWORD=…"
+  info "$PROG assess $f"
+}
+
+usage() {
+  cat <<EOF
+$PROG — move a whole database (schema + data) between servers, end to end.
+
+Usage: $PROG <command> <config> [options]
+
+  init <name>              create <name>.conf from the template
+
+  1. assess   <config>     requirements review: versions, encoding, size, LOB
+                           columns, tables without keys, log rate, CDC readiness
+  2. plan     <config>     choose full-load vs full-load+cdc, estimate, schedule
+     run      <config>     end-to-end test: load → (cdc) → validate, timed
+                           --phase test|rehearsal  (default test)
+  3. plan     <config>     re-plan with the measured throughput
+  4. run      <config> --phase rehearsal
+  5. cutover  <config>     production: drain CDC, sequences, validate, stop CDC
+
+  Steps on their own:
+     full-load <config>    dump the source and load the (empty) target
+     cdc start|status|wait|stop <config>
+     validate  <config>    compare row counts and objects  (--checksum: content)
+     report    <config>    every timed run so far
+
+Options:
+  --phase P        test | rehearsal | cutover     --deep      measure LOB lengths (scans)
+  --checksum       compare table content          --sample N  seconds to sample log rate
+  --strategy S     force full-load | full-load+cdc
+  --timeout M      minutes to wait for CDC        --keep-cdc  leave CDC running after run
+  --yes            no confirmation prompt         --force     cutover despite blockers
+
+Passwords come from the environment only: SRC_PASSWORD, TGT_PASSWORD
+(optional REPL_PASSWORD; MongoDB may use SRC_MONGO_URI / TGT_MONGO_URI instead).
+Reports and state: runs/<name>/ next to this script (override with STATE_DIR)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    help|-h|--help) usage; return ;;
+    init) cmd_init "$@"; return ;;
+  esac
+  local sub=""
+  [ "$cmd" != cdc ] || { sub="${1:-}"; shift || true; }
+  local conf="${1:-}"; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --phase) OPT_PHASE="${2:?}"; valid --phase "$OPT_PHASE" '^(test|rehearsal|cutover)$'; shift 2 ;;
+      --strategy) OPT_STRATEGY="${2:?}"; valid --strategy "$OPT_STRATEGY" '^(full-load|full-load\+cdc)$'; shift 2 ;;
+      --timeout) OPT_TIMEOUT="${2:?}"; valid --timeout "$OPT_TIMEOUT" '^[0-9]+$'; shift 2 ;;
+      --sample) SAMPLE_SECONDS_OPT="${2:?}"; valid --sample "$SAMPLE_SECONDS_OPT" '^[0-9]+$'; shift 2 ;;
+      --deep) OPT_DEEP=1; shift ;;
+      --checksum) OPT_CHECKSUM=1; shift ;;
+      --keep-cdc) OPT_KEEP_CDC=1; shift ;;
+      --yes) OPT_YES=1; shift ;;
+      --force) OPT_FORCE=1; shift ;;
+      *) die "unknown option '$1' ($PROG help)" ;;
+    esac
+  done
+  load_config "$conf"
+  [ -z "${SAMPLE_SECONDS_OPT:-}" ] || SAMPLE_SECONDS="$SAMPLE_SECONDS_OPT"
+  if [ "$CLIENT_MODE" = docker ]; then
+    docker info >/dev/null 2>&1 || die "Docker is installed but not reachable. Start it, or set CLIENT_MODE=local to use local client tools."
+  fi
+  case "$cmd" in
+    assess)    cmd_assess ;;
+    plan)      cmd_plan ;;
+    full-load) cmd_full_load ;;
+    cdc)       cmd_cdc "$sub" ;;
+    validate)  cmd_validate ;;
+    run)       cmd_run ;;
+    cutover)   cmd_cutover ;;
+    report)    cmd_report ;;
+    *) die "unknown command '$cmd' ($PROG help)" ;;
+  esac
+}
+
+main "$@"
