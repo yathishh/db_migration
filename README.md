@@ -19,7 +19,10 @@ a five-phase workflow:
 | MySQL | `mysqldump` → `mysql` | binlog replication from the dump's recorded position |
 | MongoDB | `mongodump` → `mongorestore` | — not native; use mongosync |
 
-MariaDB ⇄ MySQL also uses the dump path (full load only).
+MariaDB ⇄ MySQL goes through the converter below, not a raw dump: each rejects the
+other's default collation (`utf8mb4_uca1400_ai_ci` / `utf8mb4_0900_ai_ci`) and some
+types. Column types are kept exactly (unsigned, ENUM/SET, TIMESTAMP, ON UPDATE);
+only the collation and the types one side lacks change. Full load only.
 
 ### Different engines (`lib/xengine.sh`)
 
@@ -139,22 +142,40 @@ If validation fails it stops **before** CDC is torn down and tells you not to sw
 
 ## Tested
 
-Each path was run end to end against real servers in Docker (PostgreSQL 16, MariaDB 11,
-MySQL 8.4, MongoDB 7), with data chosen to break things: quotes, backslashes, embedded
-newlines and tabs, emoji, NULLs, binary with `\0` and `'`, JSON, arrays, enums, unsigned
-64-bit values near 2⁶⁴, composite keys, foreign keys. Values were compared field by
-field, and an MD5 over every text value matched on both sides.
+```bash
+tests/e2e.sh                  # all 16 directions (needs Docker, ~5 minutes)
+tests/e2e.sh mysql postgres   # one direction
+```
 
-| Path | Result |
-|---|---|
-| PostgreSQL → PostgreSQL (full load, and CDC with live writes + cutover) | ✅ |
-| MariaDB → MariaDB (dump + binlog CDC + cutover) | ✅ |
-| MongoDB → MongoDB | ✅ |
-| PostgreSQL → MariaDB, MySQL → PostgreSQL | ✅ |
-| PostgreSQL → MongoDB, MySQL → MongoDB | ✅ |
-| MongoDB → PostgreSQL, MongoDB → MariaDB | ✅ |
+Starts PostgreSQL 16, MariaDB 11, MySQL 8.4 and MongoDB 7, seeds each with the same
+hostile dataset (quotes, backslashes, newlines and tabs, emoji, empty string vs NULL,
+trailing spaces, binary containing NUL/quote/backslash, decimals, single-precision
+floats, booleans, timestamps, JSON, a composite key, a foreign key, a view, a function),
+and migrates **every source to every target**.
 
-Not yet exercised: MySQL ⇄ MySQL CDC, RDS targets (`TGT_MANAGED=rds`).
+Each direction must pass two independent checks:
+
+1. **Tool** — db-migrate's own `assess → plan → run → validate --checksum`.
+2. **Data** — a fingerprint computed by the source and the target engine themselves,
+   outside the tool: row count, MD5 of every text value, MD5 of every binary value,
+   MD5 of every timestamp, the decimal sum, the boolean count, the float sum.
+
+The latest run is in [tests/RESULTS.md](tests/RESULTS.md).
+
+CDC has its own suite, with a separate TLS-only source and target per engine:
+
+```bash
+tests/cdc.sh                  # PostgreSQL, MariaDB, MySQL (~4 minutes)
+```
+
+It loads the target, starts replication with `REPL_SSL=verify`, makes inserts, updates
+and deletes on the source while replication runs, cuts over, and then checks that the
+data is identical, that the live changes arrived, that the replication link itself was
+encrypted, and that nothing (slot, publication, subscription, replica configuration) is
+left behind. The latest run is in [tests/RESULTS-CDC.md](tests/RESULTS-CDC.md).
+
+Not yet exercised: managed services (RDS/Aurora with `TGT_MANAGED=rds`, Atlas,
+DocumentDB), databases using extensions, macOS.
 
 ## Things that are deliberately manual
 
@@ -173,6 +194,41 @@ MariaDB/MySQL target set `TGT_MANAGED=rds` (uses the `mysql.rds_*` procedures) a
 `replicate-do-db` in its parameter group.
 
 ## Security
+
+### Encryption in transit — on by default
+
+Data moves source → tool → target, and with CDC target → source. Every one of those
+connections is TLS-encrypted by default, and nothing falls back to plain text.
+
+| Mode | What it guarantees |
+|---|---|
+| `require` (default) | Encrypted. The tool refuses to run if the server cannot do TLS. |
+| `verify` | Encrypted **and** the server's certificate and hostname are checked against your CA (`SRC_SSL_CA` / `TGT_SSL_CA`). Also stops a man-in-the-middle. Use this for production. |
+| `disable` | Plain text. Refused unless `ALLOW_INSECURE_TRANSPORT=yes` is set explicitly. |
+
+- `prefer` is **not accepted**: it quietly downgrades to plain text when a server does
+  not offer TLS.
+- `assess` asks each **server** what protects the session and records the TLS version
+  and cipher in `assessment.md`. An unencrypted connection is a blocker.
+- The CDC connection (PostgreSQL subscription, MariaDB/MySQL replica) uses TLS too
+  (`REPL_SSL`, default `require`; `verify` with `REPL_SSL_CA_PATH` on the target server).
+- Rows are never written to disk on the way: they stream through memory from one TLS
+  connection into the other. (One exception: PostgreSQL with `JOBS>1` stages the dump in
+  a temporary directory that is deleted afterwards.)
+- A remote Docker daemon over plain `tcp://` is refused — the stream would cross the
+  network unencrypted.
+- The CA bundle is passed to the client as text and written to a private temp file
+  inside it; no host directory is mounted.
+
+`tests/e2e.sh` proves this on every run: all four servers accept **only** TLS, every
+migration runs in `verify` mode, and plain-text logins, an untrusted CA and insecure
+tool settings are each shown to be refused.
+
+Encryption **at rest** (the disks of the source and target servers, their backups) is
+the database platform's job — RDS/Aurora storage encryption, LUKS, MongoDB encrypted
+storage engine — not something a migration tool can add.
+
+### Credentials
 
 - Passwords are read from `SRC_PASSWORD`, `TGT_PASSWORD` (`REPL_PASSWORD`) only, and reach
   the clients through the environment — never on a command line visible in `ps`.
